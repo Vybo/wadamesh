@@ -684,6 +684,27 @@ public:
     return true;
   }
 
+  /** Set an explicit DIRECT route on a contact from a device-UI action.
+   *  `path_len` is the packed MeshCore form ((hash_size-1)<<6)|hop_count and
+   *  `path` carries hop_count*hash_size raw hop-hash bytes. Mirrors
+   *  uiResetContactPath() but installs a path instead of wiping it; flood is
+   *  still set via uiResetContactPath(). Returns false when the contact is
+   *  gone or the encoding is invalid (rejects the 0xFF flood sentinel and
+   *  over-long paths). */
+  bool uiSetContactPath(const uint8_t pub_key[32], const uint8_t* path, uint8_t path_len) {
+    ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!slot) return false;
+    if (!mesh::Packet::isValidPathLen(path_len)) return false;   // also rejects 0xFF
+    const uint8_t nb = (uint8_t)((path_len & 63) * ((path_len >> 6) + 1));
+    if (nb > MAX_PATH_SIZE) return false;
+    slot->out_path_len = path_len;
+    memset(slot->out_path, 0, sizeof(slot->out_path));
+    if (nb) memcpy(slot->out_path, path, nb);
+    slot->lastmod = getRTCClock()->getCurrentTime();
+    saveContacts();
+    return true;
+  }
+
   /** Update a contact's stored GPS position (microdegrees, *1e6) — e.g. from a
    *  telemetry reply that carried a CayenneLPP GPS field. Lets contacts that
    *  don't flood position adverts (but do answer telemetry) appear on the map
