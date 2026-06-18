@@ -9154,7 +9154,9 @@ static void pathsAddRawCb(lv_event_t* e) {
   const char* txt = lv_textarea_get_text(s_pe_ta);
   uint8_t b[3] = {0};
   int nb = pathsHexToBytes(txt, b, 3);
-  if (nb < (int)pathsActiveHashSize()) { if (g_lv.task) g_lv.task->showAlert(TR("Need more hex bytes"), 1200); return; }
+  const uint8_t hs = pathsActiveHashSize();
+  if (nb < (int)hs) { if (g_lv.task) g_lv.task->showAlert(TR("Need more hex bytes"), 1200); return; }
+  if (nb > (int)hs) { if (g_lv.task) g_lv.task->showAlert(TR("Hop is 1-3 bytes; using first bytes only"), 1800); }
   if (pathsAddHopBytes(b)) { lv_textarea_set_text(s_pe_ta, ""); pathsRebuild(); }
 }
 // build + apply current editor path
