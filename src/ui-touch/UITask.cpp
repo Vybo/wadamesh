@@ -9250,6 +9250,11 @@ static void pathsAddRawCb(lv_event_t* e) {
   if (pathsAddHopBytes(b)) { lv_textarea_set_text(s_pe_ta, ""); pathsRebuild(); }
 }
 // build + apply current editor path
+// Note: pathsLoadPresetCb decodes hops at the preset's own stored hash size
+// (so the editor shows the original hop bytes), but pathsApplyCb always
+// re-encodes at the CURRENT global path_hash_mode.  Loading a preset and then
+// applying it under a different global width re-derives the path at the new
+// width — this is by design ("follow global only").
 static void pathsApplyCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (s_pe_n == 0) {                                   // empty = flood
@@ -9259,6 +9264,12 @@ static void pathsApplyCb(lv_event_t* e) {
     pathsRebuild(); return;
   }
   const uint8_t hs  = pathsActiveHashSize();
+  // Guard: if the editor somehow accumulated more hops than fit at the current
+  // global hash size, reject rather than overflowing buf[MAX_PATH_SIZE].
+  if ((int)s_pe_n * hs > MAX_PATH_SIZE) {
+    if (g_lv.task) g_lv.task->showAlert(TR("Path too long for this mode"), 1500);
+    return;
+  }
   const uint8_t enc = (uint8_t)(((hs - 1) << 6) | (s_pe_n & 63));
   uint8_t buf[MAX_PATH_SIZE]; int bi = 0;
   for (int i = 0; i < s_pe_n; ++i) for (int b = 0; b < hs; ++b) buf[bi++] = s_pe_hops[i][b];
@@ -9361,15 +9372,21 @@ static void pathsRebuild() {
     if (hops == 0) {
       line("\xe2\x97\x8f Zero-hop direct", 0xE0E3E6);
     } else {
-      char hdr[40]; snprintf(hdr, sizeof hdr, "\xe2\x97\x8f DIRECT \xe2\x80\xa2 %u hops \xe2\x80\xa2 %ub", hops, hs);
-      line(hdr, 0xE0E3E6);
-      for (uint8_t i = 0; i < hops; ++i) {
-        const uint8_t* hop = &c.out_path[i * hs];
-        char hex[8]; bytesToHex(hop, hs, hex);
-        char nm[32]; char row[64];
-        if (pathResolveHop(hop, hs, nm, sizeof nm)) snprintf(row, sizeof row, "  %u. %s  (%s)", i + 1, nm, hex);
-        else                                        snprintf(row, sizeof row, "  %u. %s", i + 1, hex);
-        line(row, COLOR_TEXT);
+      // Guard: valid hash sizes are 1..3; hs==4 (0xC0..0xFE) is an invalid
+      // encoding that would cause OOB reads and a stack overflow in hex[].
+      if (hs > 3 || (int)hops * hs > MAX_PATH_SIZE) {
+        line("\xe2\x97\x8f Invalid path encoding", 0xE0E3E6);
+      } else {
+        char hdr[40]; snprintf(hdr, sizeof hdr, "\xe2\x97\x8f DIRECT \xe2\x80\xa2 %u hops \xe2\x80\xa2 %ub", hops, hs);
+        line(hdr, 0xE0E3E6);
+        for (uint8_t i = 0; i < hops; ++i) {
+          const uint8_t* hop = &c.out_path[i * hs];
+          char hex[12]; bytesToHex(hop, hs, hex);   // hex[12]: 2*hs chars + NUL, safe for hs<=3
+          char nm[32]; char row[64];
+          if (pathResolveHop(hop, hs, nm, sizeof nm)) snprintf(row, sizeof row, "  %u. %s  (%s)", i + 1, nm, hex);
+          else                                        snprintf(row, sizeof row, "  %u. %s", i + 1, hex);
+          line(row, COLOR_TEXT);
+        }
       }
     }
   }
@@ -9511,10 +9528,12 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   lv_obj_add_event_cb(s_action_sheet_root, actionSheetCloseCb, LV_EVENT_CLICKED, nullptr);
 
   const int card_w = 232;
-  // Two-column button grid so the (now up to 9) actions fit without
-  // clipping below the status bar. Delete spans the full width as the
-  // bottom danger row. Repeater worst case: 8 grid items -> 4 rows + 1
-  // delete row = 5 * (30+6) + title 28 + pad 6 = 214 px (fits in 298).
+  // Two-column button grid so the actions fit without clipping below the
+  // status bar. Delete spans the full width as the bottom danger row.
+  // Grid items: msg/ping, telemetry, range, favorite, reset, block (6 base)
+  // + Paths (1), + trace/admin for repeaters (2), + Join for rooms (1),
+  // + line-of-sight (1). Repeater worst case: 10 grid items -> 5 rows + 1
+  // delete row = 6 * (30+6) + title 28 + pad 6 = 250 px (fits in 298).
   const int btn_h = 30;
   const int btn_gap = 6;
   const int title_h = 28;
