@@ -575,6 +575,15 @@ void touchPrefsBuildLocalTz(char* out, int out_cap) {
   snprintf(out, out_cap, "<%+03d>%d", off, -off);
 }
 
+bool touchPrefsTimezonePosix(int idx, char* out, int out_cap) {
+  if (!out || out_cap <= 0) return false;
+  if (idx >= 0 && idx < TZ_ZONE_N) {
+    snprintf(out, out_cap, "%s", TZ_ZONES[idx].posix);
+    return true;
+  }
+  return false;   // Custom slot / out of range — no fixed POSIX string
+}
+
 uint32_t touchPrefsGetLockTextColor() {
   if (!s_begun) touchPrefsBegin();
   return s_cfg.lock_color & 0xFFFFFFu;

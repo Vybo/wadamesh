@@ -82,6 +82,7 @@
     // its include path, so an angle include picks that up and misses accessors we
     // add here (e.g. the signal-probe prefs). Quotes force the local src/ copy.
     #include "../helpers/esp32/TouchPrefsStore.h"
+    #include "../helpers/esp32/ClockStore.h"   // Clock app: world-clock / timer / alarm persistence
     #if defined(MULTI_TRANSPORT_COMPANION)
       #include <WiFi.h>
       #include <HTTPClient.h>
@@ -294,6 +295,10 @@ extern "C" const lv_font_t person_font14;   // 14 px — for g_font_14 (chat lis
 // own one-glyph font, spliced into the g_font_16 fallback chain like person_font.
 extern "C" const lv_font_t zoom_font;
 #define TOUCH_SYM_ZOOM    "\xEF\x80\x82"   /* U+F002 magnifying-glass */
+// Clock app icon: the ⌚ watch emoji (U+231A) is already carried by the extras_*
+// fallback fonts (spliced into g_font_12/14/16 in initTouchFontFallbacks), so no
+// new glyph font is needed — it renders wherever those fonts are used.
+#define TOUCH_SYM_CLOCK   "\xE2\x8C\x9A"   /* U+231A watch (from extras_font) */
 
 // Extras fallback fonts — em-dash (U+2014), ellipsis (U+2026), middle dot
 // (U+00B7). LVGL's stock Montserrat subset doesn't include these, so any
@@ -821,6 +826,13 @@ static inline bool kbMirrorActive() {
   return true;
 #endif
 }
+
+// ---- Clock app overlay roots (impl lower in file). Declared here so the popup
+// gating helpers (drawerPopupOpen / anyPopupOpen / hwKeyDismissTopPopup) above the
+// implementation can see them. ----
+static lv_obj_t* s_clock_root      = nullptr;   // the app overlay (4 subtabs)
+static lv_obj_t* s_clock_ring_root = nullptr;   // alarm/timer "ringing" overlay
+static lv_obj_t* s_clock_edit_root = nullptr;   // add/edit alarm or timer-preset modal
 
 // ---- Chats "+" add-channel modal pointers (see lower in file for impl) ----
 static lv_obj_t* s_addch_sheet      = nullptr;
@@ -1603,6 +1615,13 @@ static void channelGearCb(lv_event_t* e);
 static void openBlockedUsersModal();                            // ignore-list manager (unblock)
 static bool overlayBlocksTabSwipe();   // theme/channel-scope pickers swallow tab swipes
 static bool drawerPopupOpen();         // popups floating over the app drawer (signal/mentions/power/files)
+// ---- Clock app (impl lower in file) — forward decls for the close paths the
+// hardware-key dismiss + popup gating above need, and the loop/launch hooks. ----
+static void openClockApp();
+static void closeClockApp();
+static void clockCloseEdit();
+static void clockCloseRing(bool snooze);
+static void clockServiceTick(uint32_t now_epoch);   // always-on: timer expiry + alarm firing
 static void refreshContactsList();
 static void contactsListForceRefresh();   // refresh past the no-change cache (e.g. fav toggle, where the count is unchanged)
 static void refreshThreadLists();
@@ -19788,6 +19807,7 @@ static void updateTrackball(unsigned long now) {
 // Defined OUTSIDE HAS_TDECK_KEYBOARD so the ungated gesture handlers can use it.
 static bool drawerPopupOpen() {
   return s_siginfo_root || s_monitor_root || s_mentions_root || s_power_menu || s_ct_sort_sheet || s_ctd_overlay || settingsModalIsOpen()
+         || s_clock_root || s_clock_ring_root || s_clock_edit_root
 #if defined(HAS_TDECK_GT911)
          || s_fullscreen_view
 #endif
@@ -19800,7 +19820,8 @@ static bool anyPopupOpen() {
          s_channel_long_sheet || s_action_sheet_root || s_contacts_search_sheet ||
          s_contacts_overflow_root || s_share_my_root || s_los_root || s_admin_root ||
          s_meminfo_root || settingsModalIsOpen() || s_settings_sheet || s_cc_root ||
-         s_appdrawer_root || s_power_menu || s_siginfo_root || s_monitor_root || s_mentions_root || s_ct_sort_sheet || s_ctd_overlay
+         s_appdrawer_root || s_power_menu || s_siginfo_root || s_monitor_root || s_mentions_root || s_ct_sort_sheet || s_ctd_overlay ||
+         s_clock_root || s_clock_ring_root || s_clock_edit_root
 #if defined(HAS_TDECK_GT911)
          || s_fullscreen_view || s_term_picker_root || s_fm_prompt || s_fm_actions || s_editor_root || s_fm_img_root
 #endif
@@ -19811,6 +19832,9 @@ static bool anyPopupOpen() {
 // Close the topmost popup / modal (front-to-back priority), like tapping its
 // X / close button. Returns true if one was dismissed.
 static bool hwKeyDismissTopPopup() {
+  if (s_clock_ring_root)  { clockCloseRing(false);     return true; }   // a ringing alarm/timer — stop it first
+  if (s_clock_edit_root)  { clockCloseEdit();          return true; }   // add/edit modal over the clock app
+  if (s_clock_root)       { closeClockApp();           return true; }   // the clock app overlay
   if (s_meminfo_root)     { closeMemInfo();            return true; }   // topmost diagnostic popup
   if (s_monitor_root)     { closeMonitorPage();        return true; }   // RF monitor app page
 #if defined(HAS_TDECK_GT911)
@@ -21793,7 +21817,7 @@ static void openControlCenter() {
 enum AppDrawerAction {
   APPACT_CHATS, APPACT_CONTACTS, APPACT_MAP, APPACT_SETTINGS,
   APPACT_ADVERT, APPACT_POWER, APPACT_MENTIONS, APPACT_CMDCENTER, APPACT_SIGNAL,
-  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_SNAKE,
+  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_SNAKE, APPACT_CLOCK,
 };
 
 static void closeAppDrawer() {
@@ -22013,6 +22037,1045 @@ static void openMentionsScreen() {
   }
 }
 
+// ======================================================================
+//  Clock app — launcher overlay with four subtabs (World Clock / Timers /
+//  Alarms / Stopwatch). Opened from the app drawer like Snake (floats on
+//  lv_layer_top, drawer stays underneath). Countdown expiry and alarm firing
+//  run from clockServiceTick(), called every loop iteration, so they work even
+//  when this overlay is closed. Sound is synthesised tone-melodies (no audio
+//  files exist on this hardware) — see clockPlayRingtone().
+// ======================================================================
+
+// ---- limits + in-memory model (s_*_root pointers live up near s_addch_sheet) ----
+static const int CLOCK_MAX_RUN = 8;     // concurrent running countdowns
+static const int CLOCK_MAX_LAP = 20;    // stopwatch laps kept
+
+static ClockWorldEntry  s_world[CLOCK_MAX_WORLD]; static int s_world_n = 0;
+static ClockTimerPreset s_pre[CLOCK_MAX_TIMERS];  static int s_pre_n   = 0;
+static ClockAlarm       s_alm[CLOCK_MAX_ALARMS];  static int s_alm_n   = 0;
+static bool             s_clock_loaded = false;
+
+struct ClockRun { uint32_t end_epoch; uint32_t dur_sec; char name[24]; uint8_t ringtone; bool active; };
+static ClockRun s_run[CLOCK_MAX_RUN] = {};
+
+// stopwatch (in-memory; survives subtab switch + app close, not reboot)
+static bool     s_sw_run   = false;
+static uint32_t s_sw_accum = 0, s_sw_t0 = 0;
+static uint32_t s_sw_lap[CLOCK_MAX_LAP]; static int s_sw_nlap = 0;
+
+// alarm runtime guards: last-fired key (yday<<16 | min-of-day) so one tick fires
+// once; snooze re-fire epoch (0 = none). Cleared on reboot.
+static uint32_t s_alm_guard[CLOCK_MAX_ALARMS]  = {};
+static uint32_t s_alm_snooze[CLOCK_MAX_ALARMS] = {};
+
+// ring controller (a fired alarm/timer): re-trigger the melody every ~1.5 s until
+// dismissed, auto-stop after 60 s so a missed alarm can't drain the battery.
+static bool     s_ring_active = false;
+static uint8_t  s_ring_tone   = RING_SILENT;
+static uint32_t s_ring_t0 = 0, s_ring_last = 0;
+static bool     s_ring_is_alarm = false;
+static int      s_ring_alm = -1;
+static const uint32_t CLOCK_RING_REP_MS  = 1500;
+static const uint32_t CLOCK_RING_MAX_MS  = 60000;
+
+// ---- live UI handles (valid only while s_clock_root is up) ----
+static lv_obj_t*   s_clk_seg[4]    = {};
+static lv_obj_t*   s_clk_sub[4]    = {};
+static int         s_clock_active  = 0;
+static lv_timer_t* s_clk_tick      = nullptr;
+static lv_obj_t*   s_clk_local_lbl = nullptr;
+static lv_obj_t*   s_clk_date_lbl  = nullptr;
+static lv_obj_t*   s_clk_world_box = nullptr;
+static lv_obj_t*   s_clk_world_t[CLOCK_MAX_WORLD] = {};
+static lv_obj_t*   s_clk_run_box   = nullptr;   // unified Timers tab scroll box (running + presets)
+static lv_obj_t*   s_clk_run_lbl[CLOCK_MAX_RUN]    = {};
+static lv_obj_t*   s_clk_alm_box   = nullptr;
+static lv_obj_t*   s_clk_sw_lbl    = nullptr;
+static lv_obj_t*   s_clk_sw_lapbox = nullptr;
+static lv_obj_t*   s_clk_sw_run_lbl = nullptr;
+static lv_obj_t*   s_clk_ring_time = nullptr;
+
+// ---- add/edit modal (shared root s_clock_edit_root): 0=timer, 1=alarm, 2=zone picker ----
+static int               s_edit_kind = 0;
+static ClockTimerPreset  s_edit_pre  = {};
+static ClockAlarm        s_edit_alm  = {};
+static lv_obj_t*         s_edit_name_ta  = nullptr;
+static lv_obj_t*         s_edit_v[4]     = {};   // stepper value labels
+static lv_obj_t*         s_edit_ring_lbl = nullptr;
+static lv_obj_t*         s_edit_day[7]   = {};
+
+// forward decls within the Clock block
+static void clockRebuildWorld();
+static void clockRebuildRuns();      // unified Timers tab: running countdowns + saved presets
+static void clockLaunchPresetCb(lv_event_t* e);
+static void clockDelPresetCb(lv_event_t* e);
+static void clockAddTimerBtnCb(lv_event_t* e);
+static void clockRebuildAlarms();
+static void clockRefreshLocal();
+static void clockRefreshWorld();
+static void clockRefreshRuns();
+static void clockRefreshStopwatch();
+static void clockEditUpdateVals();
+static bool clockOpenRing(const char* title, bool is_alarm, int alm_idx, uint8_t tone);  // false if a ring is already up
+static void clockShowSub(int i);
+static inline bool clockUiOpen() { return s_clock_root != nullptr; }
+
+static void clockEnsureLoaded() {
+  if (s_clock_loaded) return;
+  s_clock_loaded = true;
+  clockLoadWorld(s_world,  CLOCK_MAX_WORLD,  s_world_n);
+  clockLoadTimers(s_pre,   CLOCK_MAX_TIMERS, s_pre_n);
+  clockLoadAlarms(s_alm,   CLOCK_MAX_ALARMS, s_alm_n);
+}
+
+// ---- ringtones: small note tables; playback mirrors the message-chime path
+//      (install I2S → play → uninstall on T-Deck; tone()/noTone() on V4). ----
+struct ClockNote { uint16_t f, ms; };
+static const ClockNote RING_CHIME_N[]  = { {880,90}, {1318,110} };
+static const ClockNote RING_BEEP_N[]   = { {1000,150} };
+static const ClockNote RING_ASCEND_N[] = { {800,100}, {1200,100}, {1600,130} };
+static const ClockNote RING_URGENT_N[] = { {2349,70}, {2349,70}, {2349,90} };
+static void clockRingNotes(uint8_t id, const ClockNote** n, int* c) {
+  switch (id) {
+    case RING_CHIME:  *n = RING_CHIME_N;  *c = 2; return;
+    case RING_BEEP:   *n = RING_BEEP_N;   *c = 1; return;
+    case RING_ASCEND: *n = RING_ASCEND_N; *c = 3; return;
+    case RING_URGENT: *n = RING_URGENT_N; *c = 3; return;
+    default:          *n = nullptr;       *c = 0; return;
+  }
+}
+#if defined(HAS_UI_SOUND)
+static volatile bool s_clk_tone_busy = false;
+struct ClkToneJob { ClockNote n[4]; int c; int vol; };
+static void clkToneTask(void* arg) {
+  ClkToneJob* j = (ClkToneJob*)arg;
+#if defined(HAS_TDECK_GT911)
+  if (tdeckAudioInstall()) {
+    for (int i = 0; i < j->c; ++i) tdeckPlayToneRaw(j->n[i].f, j->n[i].ms, j->vol);
+    i2s_driver_uninstall(kI2sPort);
+  }
+#elif defined(HELTEC_V4_BUZZER_PIN)
+  for (int i = 0; i < j->c; ++i) { tone(HELTEC_V4_BUZZER_PIN, j->n[i].f); vTaskDelay(pdMS_TO_TICKS(j->n[i].ms)); }
+  noTone(HELTEC_V4_BUZZER_PIN);
+  pinMode(HELTEC_V4_BUZZER_PIN, INPUT);   // high-Z → silent at idle
+#endif
+  free(j);
+  s_clk_tone_busy = false;
+  vTaskDelete(nullptr);
+}
+#endif
+// Play one ringtone melody once. Caller drives repetition (the ring controller).
+static void clockPlayRingtone(uint8_t id) {
+  if (id == RING_SILENT) return;
+  if (g_lv.task && g_lv.task->isBuzzerQuiet()) return;   // master Sound switch off → silent (visual ring only)
+#if defined(HAS_UI_SOUND)
+  if (s_clk_tone_busy) return;                           // don't stack tasks/I2S
+  const ClockNote* n; int c; clockRingNotes(id, &n, &c);
+  if (!n || c <= 0) return;
+  if (c > 4) c = 4;
+  ClkToneJob* j = (ClkToneJob*)malloc(sizeof(ClkToneJob));
+  if (!j) return;
+  for (int i = 0; i < c; ++i) j->n[i] = n[i];
+  j->c = c;
+  j->vol = (int)touchPrefsGetSoundVolume() * 130;        // 0..100 → 0..13000 amplitude (T-Deck)
+  s_clk_tone_busy = true;
+  if (xTaskCreate(clkToneTask, "clkTone", 4096, j, 3, nullptr) != pdPASS) { free(j); s_clk_tone_busy = false; }
+#else
+  (void)id;
+#endif
+}
+
+// ---- time helpers ----
+// Fill `out` with the wall-clock time in a curated TZ preset, WITHOUT disturbing
+// the device's own zone. POSIX setenv/tzset is global state, so we swap → read →
+// restore. Once-per-minute for a few zones is cheap (the per-frame warning in the
+// notes is about doing this every render).
+static void clockTmInZone(int tz_index, time_t now, struct tm* out) {
+  char posix[48];
+  if (!touchPrefsTimezonePosix(tz_index, posix, sizeof posix)) { localtime_r(&now, out); return; }
+  char saved[48] = {0};
+  const char* cur = getenv("TZ");
+  if (cur) { strncpy(saved, cur, sizeof saved - 1); }
+  setenv("TZ", posix, 1); tzset();
+  localtime_r(&now, out);
+  if (saved[0]) setenv("TZ", saved, 1); else unsetenv("TZ");
+  tzset();
+}
+static void clockFmtDur(char* b, size_t n, uint32_t s) {
+  if (s >= 3600) snprintf(b, n, "%u:%02u:%02u", (unsigned)(s/3600), (unsigned)((s/60)%60), (unsigned)(s%60));
+  else           snprintf(b, n, "%u:%02u",       (unsigned)(s/60),  (unsigned)(s%60));
+}
+// day ordinal for the +1d/-1d world-clock chip (year*366 + yday, wrap-safe enough)
+static long clockDayOrd(const struct tm* t) { return (long)t->tm_year * 366 + t->tm_yday; }
+
+// ---- World Clock subtab ----
+static void clockRefreshLocal() {
+  time_t now = time(nullptr);
+  struct tm lt; localtime_r(&now, &lt);
+  if (s_clk_local_lbl) {
+    char hm[16];
+    if (now <= 1700000000) {
+      snprintf(hm, sizeof hm, "--:--:--");
+    } else if (touchPrefsGetClock12h()) {           // 12h: HH:MM:SS + AM/PM (don't append after fmtClockHM's AM/PM)
+      int h12 = lt.tm_hour % 12; if (h12 == 0) h12 = 12;
+      snprintf(hm, sizeof hm, "%d:%02d:%02d %s", h12, lt.tm_min, lt.tm_sec, lt.tm_hour < 12 ? "AM" : "PM");
+    } else {
+      snprintf(hm, sizeof hm, "%02d:%02d:%02d", lt.tm_hour, lt.tm_min, lt.tm_sec);
+    }
+    lv_label_set_text(s_clk_local_lbl, hm);
+  }
+  if (s_clk_date_lbl) {
+    char d[40];
+    if (now > 1700000000) strftime(d, sizeof d, "%a %d %b %Y", &lt);
+    else                  snprintf(d, sizeof d, "%s", "clock not set");
+    lv_label_set_text(s_clk_date_lbl, d);
+  }
+}
+static void clockRefreshWorld() {
+  time_t now = time(nullptr);
+  if (now <= 1700000000) return;
+  struct tm lt; localtime_r(&now, &lt);
+  const long lord = clockDayOrd(&lt);
+  for (int i = 0; i < s_world_n; ++i) {
+    if (!s_clk_world_t[i]) continue;
+    struct tm zt; clockTmInZone(s_world[i].tz_index, now, &zt);
+    char hm[12]; fmtClockHM(hm, sizeof hm, &zt);
+    const long d = clockDayOrd(&zt) - lord;
+    char row[24];
+    if (d > 0)      snprintf(row, sizeof row, "%s  +1d", hm);
+    else if (d < 0) snprintf(row, sizeof row, "%s  -1d", hm);
+    else            snprintf(row, sizeof row, "%s", hm);
+    lv_label_set_text(s_clk_world_t[i], row);
+  }
+}
+static void clockDelWorldCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_world_n) return;
+  for (int k = i; k < s_world_n - 1; ++k) s_world[k] = s_world[k + 1];
+  --s_world_n;
+  clockSaveWorld(s_world, s_world_n);
+  clockRebuildWorld();
+}
+static void clockRebuildWorld() {
+  if (!s_clk_world_box) return;
+  lv_obj_clean(s_clk_world_box);
+  for (int i = 0; i < CLOCK_MAX_WORLD; ++i) s_clk_world_t[i] = nullptr;
+  const lv_coord_t w = lv_obj_get_width(s_clk_world_box);
+  for (int i = 0; i < s_world_n; ++i) {
+    lv_obj_t* row = lv_obj_create(s_clk_world_box);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, w - 4, 34);
+    styleSurface(row, COLOR_PANEL, 6);
+    lv_obj_set_style_bg_opa(row, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, clockDelWorldCb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)i);
+    lv_obj_t* nm = lv_label_create(row);
+    const char* lbl = s_world[i].label[0] ? s_world[i].label : touchPrefsTimezoneLabel(s_world[i].tz_index);
+    lv_label_set_text(nm, lbl ? lbl : "?");
+    lv_obj_set_style_text_font(nm, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(nm, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(nm, LV_ALIGN_LEFT_MID, 8, 0);
+    lv_obj_set_width(nm, w - 110);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_t* tv = lv_label_create(row);
+    lv_label_set_text(tv, "--:--");
+    lv_obj_set_style_text_font(tv, &g_font_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tv, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+    lv_obj_align(tv, LV_ALIGN_RIGHT_MID, -8, 0);
+    s_clk_world_t[i] = tv;
+  }
+  clockRefreshWorld();
+}
+
+// ---- Timers subtab ----
+static void clockRefreshRuns() {
+  time_t now = time(nullptr);
+  int slot = 0;
+  for (int i = 0; i < CLOCK_MAX_RUN; ++i) {
+    if (!s_run[i].active) continue;
+    if (slot < CLOCK_MAX_RUN && s_clk_run_lbl[slot]) {
+      uint32_t rem = (s_run[i].end_epoch > (uint32_t)now) ? (s_run[i].end_epoch - (uint32_t)now) : 0;
+      char b[40]; char d[16]; clockFmtDur(d, sizeof d, rem);
+      snprintf(b, sizeof b, "%s   %s", s_run[i].name, d);
+      lv_label_set_text(s_clk_run_lbl[slot], b);
+    }
+    ++slot;
+  }
+}
+static void clockStopRunCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i >= 0 && i < CLOCK_MAX_RUN) s_run[i].active = false;
+  clockRebuildRuns();
+}
+static void clockRebuildRuns() {      // builds the whole Timers tab into one scroll box
+  if (!s_clk_run_box) return;
+  lv_obj_clean(s_clk_run_box);
+  for (int i = 0; i < CLOCK_MAX_RUN; ++i) s_clk_run_lbl[i] = nullptr;
+  const lv_coord_t w = lv_obj_get_width(s_clk_run_box);
+  lv_obj_t* rh = lv_label_create(s_clk_run_box);
+  lv_label_set_text(rh, TR("Running"));
+  lv_obj_set_style_text_font(rh, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(rh, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  int slot = 0;
+  for (int i = 0; i < CLOCK_MAX_RUN; ++i) {
+    if (!s_run[i].active) continue;
+    lv_obj_t* row = lv_obj_create(s_clk_run_box);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, w - 4, 34);
+    styleSurface(row, COLOR_PANEL, 6);
+    lv_obj_set_style_bg_opa(row, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* lb = lv_label_create(row);
+    lv_label_set_text(lb, s_run[i].name);
+    lv_obj_set_style_text_font(lb, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lb, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(lb, LV_ALIGN_LEFT_MID, 8, 0);
+    s_clk_run_lbl[slot] = lb;
+    lv_obj_t* stop = lv_btn_create(row);
+    lv_obj_set_size(stop, 56, 26);
+    lv_obj_align(stop, LV_ALIGN_RIGHT_MID, -6, 0);
+    styleButton(stop);
+    lv_obj_add_event_cb(stop, clockStopRunCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* sl = lv_label_create(stop); lv_label_set_text(sl, TR("Stop")); lv_obj_center(sl);
+    ++slot;
+  }
+  if (slot == 0) {
+    lv_obj_t* none = lv_label_create(s_clk_run_box);
+    lv_label_set_text(none, TR("No timers running"));
+    lv_obj_set_style_text_font(none, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(none, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  }
+  lv_obj_t* add = lv_btn_create(s_clk_run_box);
+  lv_obj_set_size(add, w - 6, 30);
+  styleButton(add);
+  lv_obj_add_event_cb(add, clockAddTimerBtnCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* al = lv_label_create(add); lv_label_set_text(al, TR("+ New preset")); lv_obj_center(al);
+  lv_obj_t* ph = lv_label_create(s_clk_run_box);
+  lv_label_set_text(ph, TR("Presets"));
+  lv_obj_set_style_text_font(ph, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ph, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  for (int i = 0; i < s_pre_n; ++i) {
+    lv_obj_t* row = lv_obj_create(s_clk_run_box);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, w - 4, 36);
+    styleSurface(row, COLOR_PANEL, 6);
+    lv_obj_set_style_bg_opa(row, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* nm = lv_label_create(row);
+    char b[40]; char d[16]; clockFmtDur(d, sizeof d, s_pre[i].dur_sec);
+    snprintf(b, sizeof b, "%s  %s", s_pre[i].name, d);
+    lv_label_set_text(nm, b);
+    lv_obj_set_style_text_font(nm, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(nm, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(nm, LV_ALIGN_LEFT_MID, 8, 0);
+    lv_obj_set_width(nm, w - 120);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_t* go = lv_btn_create(row);
+    lv_obj_set_size(go, 50, 28);
+    lv_obj_align(go, LV_ALIGN_RIGHT_MID, -58, 0);
+    styleButton(go);
+    lv_obj_add_event_cb(go, clockLaunchPresetCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* gl = lv_label_create(go); lv_label_set_text(gl, TR("Start")); lv_obj_center(gl);
+    lv_obj_t* del = lv_btn_create(row);
+    lv_obj_set_size(del, 44, 28);
+    lv_obj_align(del, LV_ALIGN_RIGHT_MID, -6, 0);
+    styleButton(del);
+    lv_obj_add_event_cb(del, clockDelPresetCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* dl = lv_label_create(del); lv_label_set_text(dl, LV_SYMBOL_TRASH); lv_obj_center(dl);
+  }
+  clockRefreshRuns();
+}
+static void clockLaunchPresetCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_pre_n) return;
+  for (int k = 0; k < CLOCK_MAX_RUN; ++k) if (!s_run[k].active) {
+    s_run[k].active = true;
+    s_run[k].dur_sec = s_pre[i].dur_sec;
+    s_run[k].end_epoch = (uint32_t)time(nullptr) + s_pre[i].dur_sec;
+    s_run[k].ringtone = s_pre[i].ringtone;
+    strncpy(s_run[k].name, s_pre[i].name, sizeof s_run[k].name - 1);
+    s_run[k].name[sizeof s_run[k].name - 1] = '\0';
+    clockRebuildRuns();
+    return;
+  }
+  if (g_lv.task) g_lv.task->showAlert(TR("Too many timers running"), 1800);
+}
+static void clockDelPresetCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_pre_n) return;
+  for (int k = i; k < s_pre_n - 1; ++k) s_pre[k] = s_pre[k + 1];
+  --s_pre_n;
+  clockSaveTimers(s_pre, s_pre_n);
+  clockRebuildRuns();
+}
+
+// ---- Alarms subtab ----
+static void clockAlarmEnCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_alm_n) return;
+  s_alm[i].enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED) ? 1 : 0;
+  s_alm_snooze[i] = 0;
+  clockSaveAlarms(s_alm, s_alm_n);
+}
+static void clockDelAlarmCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_alm_n) return;
+  for (int k = i; k < s_alm_n - 1; ++k) { s_alm[k] = s_alm[k + 1]; s_alm_snooze[k] = s_alm_snooze[k + 1]; s_alm_guard[k] = s_alm_guard[k + 1]; }
+  --s_alm_n;
+  clockSaveAlarms(s_alm, s_alm_n);
+  clockRebuildAlarms();
+}
+static void clockRebuildAlarms() {
+  if (!s_clk_alm_box) return;
+  lv_obj_clean(s_clk_alm_box);
+  const lv_coord_t w = lv_obj_get_width(s_clk_alm_box);
+  static const char* kDay = "SMTWTFS";   // bit0=Sun .. bit6=Sat
+  for (int i = 0; i < s_alm_n; ++i) {
+    lv_obj_t* row = lv_obj_create(s_clk_alm_box);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, w - 4, 46);
+    styleSurface(row, COLOR_PANEL, 6);
+    lv_obj_set_style_bg_opa(row, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* tm = lv_label_create(row);
+    lv_label_set_text_fmt(tm, "%02d:%02d", s_alm[i].hour, s_alm[i].minute);
+    lv_obj_set_style_text_font(tm, &g_font_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tm, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(tm, LV_ALIGN_TOP_LEFT, 8, 4);
+    // repeat-days summary, or label, under the time
+    char sub[48];
+    if (s_alm[i].days_mask) {
+      char ds[16]; int p = 0;
+      for (int b = 0; b < 7 && p < (int)sizeof ds - 1; ++b) if (s_alm[i].days_mask & (1 << b)) ds[p++] = kDay[b];
+      ds[p] = '\0';
+      snprintf(sub, sizeof sub, "%s  %s", ds, s_alm[i].label);
+    } else {
+      snprintf(sub, sizeof sub, "%s  %s", TR("once"), s_alm[i].label);
+    }
+    lv_obj_t* sl = lv_label_create(row);
+    lv_label_set_text(sl, sub);
+    lv_obj_set_style_text_font(sl, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_align(sl, LV_ALIGN_BOTTOM_LEFT, 8, -4);
+    lv_obj_set_width(sl, w - 130);
+    lv_label_set_long_mode(sl, LV_LABEL_LONG_DOT);
+    lv_obj_t* en = lv_switch_create(row);
+    lv_obj_set_size(en, 44, 24);
+    lv_obj_align(en, LV_ALIGN_RIGHT_MID, -56, 0);
+    if (s_alm[i].enabled) lv_obj_add_state(en, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(en, clockAlarmEnCb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)i);
+    lv_obj_t* del = lv_btn_create(row);
+    lv_obj_set_size(del, 44, 28);
+    lv_obj_align(del, LV_ALIGN_RIGHT_MID, -6, 0);
+    styleButton(del);
+    lv_obj_add_event_cb(del, clockDelAlarmCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* dl = lv_label_create(del); lv_label_set_text(dl, LV_SYMBOL_TRASH); lv_obj_center(dl);
+  }
+}
+
+// ---- Stopwatch subtab ----
+static inline uint32_t clockSwElapsed() { return s_sw_accum + (s_sw_run ? (millis() - s_sw_t0) : 0); }
+static void clockRefreshStopwatch() {
+  if (!s_clk_sw_lbl) return;
+  uint32_t e = clockSwElapsed();
+  uint32_t h = e / 3600000u; if (h > 99) { h = 99; e = 99u*3600000u + 59u*60000u + 59u*1000u + 990u; }
+  uint32_t mm = (e / 60000u) % 60u, ss = (e / 1000u) % 60u, cs = (e / 10u) % 100u;
+  char b[16]; snprintf(b, sizeof b, "%02u:%02u:%02u.%02u", (unsigned)h, (unsigned)mm, (unsigned)ss, (unsigned)cs);
+  lv_label_set_text(s_clk_sw_lbl, b);
+}
+static void clockSwRebuildLaps() {
+  if (!s_clk_sw_lapbox) return;
+  lv_obj_clean(s_clk_sw_lapbox);
+  const lv_coord_t w = lv_obj_get_width(s_clk_sw_lapbox);
+  for (int i = s_sw_nlap - 1; i >= 0; --i) {
+    uint32_t total = s_sw_lap[i];
+    uint32_t split = (i == 0) ? s_sw_lap[0] : (s_sw_lap[i] - s_sw_lap[i - 1]);
+    lv_obj_t* r = lv_label_create(s_clk_sw_lapbox);
+    char b[48];
+    snprintf(b, sizeof b, "Lap %d   +%u:%02u.%02u   %u:%02u.%02u", i + 1,
+             (unsigned)((split/60000u)%60u), (unsigned)((split/1000u)%60u), (unsigned)((split/10u)%100u),
+             (unsigned)((total/60000u)%60u), (unsigned)((total/1000u)%60u), (unsigned)((total/10u)%100u));
+    lv_label_set_text(r, b);
+    lv_obj_set_style_text_font(r, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(r, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_width(r, w - 6);
+  }
+}
+static void clockSwStartStopCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (s_sw_run) { s_sw_accum = clockSwElapsed(); s_sw_run = false; }
+  else          { s_sw_t0 = millis(); s_sw_run = true; }
+  if (s_clk_sw_run_lbl) lv_label_set_text(s_clk_sw_run_lbl, s_sw_run ? TR("Stop") : TR("Start"));
+}
+static void clockSwResetLapCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (s_sw_run) {                          // running → Lap
+    if (s_sw_nlap < CLOCK_MAX_LAP) s_sw_lap[s_sw_nlap++] = clockSwElapsed();
+    clockSwRebuildLaps();
+  } else {                                 // stopped → Reset
+    s_sw_accum = 0; s_sw_t0 = 0; s_sw_nlap = 0;
+    clockSwRebuildLaps();
+    clockRefreshStopwatch();
+  }
+}
+
+// ---- add/edit modal (timer preset, alarm) + zone picker ----
+static uint8_t* clockEditRingPtr() { return (s_edit_kind == 1) ? &s_edit_alm.ringtone : &s_edit_pre.ringtone; }
+static void clockEditUpdateVals() {
+  if (s_edit_kind == 1) {                  // alarm: hour, minute
+    if (s_edit_v[0]) lv_label_set_text_fmt(s_edit_v[0], "%02d", s_edit_alm.hour);
+    if (s_edit_v[1]) lv_label_set_text_fmt(s_edit_v[1], "%02d", s_edit_alm.minute);
+    for (int b = 0; b < 7; ++b) if (s_edit_day[b]) {
+      if (s_edit_alm.days_mask & (1 << b)) lv_obj_add_state(s_edit_day[b], LV_STATE_CHECKED);
+      else                                 lv_obj_clear_state(s_edit_day[b], LV_STATE_CHECKED);
+    }
+  } else if (s_edit_kind == 0) {           // timer: minutes, seconds
+    if (s_edit_v[0]) lv_label_set_text_fmt(s_edit_v[0], "%02u", (unsigned)(s_edit_pre.dur_sec / 60));
+    if (s_edit_v[1]) lv_label_set_text_fmt(s_edit_v[1], "%02u", (unsigned)(s_edit_pre.dur_sec % 60));
+  }
+  if (s_edit_ring_lbl) lv_label_set_text(s_edit_ring_lbl, clockRingtoneName(*clockEditRingPtr()));
+}
+enum { CKF_A = 0, CKF_B = 1 };   // stepper fields: A=hour/minutes, B=minute/seconds
+static void clockStepCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int code = (int)(intptr_t)lv_event_get_user_data(e);
+  int field = code >> 1, dir = (code & 1) ? 1 : -1;
+  if (s_edit_kind == 1) {
+    if (field == CKF_A) s_edit_alm.hour   = (uint8_t)((s_edit_alm.hour   + dir + 24) % 24);
+    else                s_edit_alm.minute = (uint8_t)((s_edit_alm.minute + dir + 60) % 60);
+  } else {
+    if (field == CKF_A) { int m = (int)(s_edit_pre.dur_sec / 60) + dir; if (m < 0) m = 0; if (m > 180) m = 180; s_edit_pre.dur_sec = (uint32_t)m * 60 + (s_edit_pre.dur_sec % 60); }
+    else                { int s = (int)(s_edit_pre.dur_sec % 60) + dir; if (s < 0) s = 59; if (s > 59) s = 0; s_edit_pre.dur_sec = (s_edit_pre.dur_sec / 60) * 60 + (uint32_t)s; }
+  }
+  clockEditUpdateVals();
+}
+static void clockMakeStepper(lv_obj_t* parent, int x, int y, int w, const char* cap, int field, lv_obj_t** outv) {
+  lv_obj_t* c = lv_label_create(parent);
+  lv_label_set_text(c, cap);
+  lv_obj_set_style_text_font(c, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(c, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(c, x, y);
+  lv_obj_t* mn = lv_btn_create(parent); lv_obj_set_size(mn, 34, 30); lv_obj_set_pos(mn, x, y + 16); styleButton(mn);
+  lv_obj_add_event_cb(mn, clockStepCb, LV_EVENT_CLICKED, (void*)(intptr_t)(field * 2 + 0));
+  lv_obj_t* ml = lv_label_create(mn); lv_label_set_text(ml, "-"); lv_obj_center(ml);
+  lv_obj_t* v = lv_label_create(parent);
+  lv_obj_set_style_text_font(v, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(v, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_size(v, w - 76, 30);
+  lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_set_pos(v, x + 38, y + 20);
+  lv_obj_t* pl = lv_btn_create(parent); lv_obj_set_size(pl, 34, 30); lv_obj_set_pos(pl, x + w - 34, y + 16); styleButton(pl);
+  lv_obj_add_event_cb(pl, clockStepCb, LV_EVENT_CLICKED, (void*)(intptr_t)(field * 2 + 1));
+  lv_obj_t* pll = lv_label_create(pl); lv_label_set_text(pll, "+"); lv_obj_center(pll);
+  *outv = v;
+}
+static void clockRingCycleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  uint8_t* r = clockEditRingPtr();
+  *r = (uint8_t)((*r + 1) % RING_COUNT);
+  clockEditUpdateVals();
+  clockPlayRingtone(*r);                   // preview
+}
+static void clockDayCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int b = (int)(intptr_t)lv_event_get_user_data(e);
+  s_edit_alm.days_mask ^= (uint8_t)(1 << b);
+  clockEditUpdateVals();
+}
+static void clockSaveEditCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (s_edit_kind == 1) {
+    if (s_alm_n >= CLOCK_MAX_ALARMS) { if (g_lv.task) g_lv.task->showAlert(TR("Alarm list full"), 1800); return; }
+    if (s_edit_name_ta) { strncpy(s_edit_alm.label, lv_textarea_get_text(s_edit_name_ta), sizeof s_edit_alm.label - 1); s_edit_alm.label[sizeof s_edit_alm.label - 1] = '\0'; }
+    s_edit_alm.enabled = 1;
+    s_alm[s_alm_n] = s_edit_alm;
+    s_alm_guard[s_alm_n] = 0; s_alm_snooze[s_alm_n] = 0;
+    ++s_alm_n;
+    clockSaveAlarms(s_alm, s_alm_n);
+    clockRebuildAlarms();
+  } else if (s_edit_kind == 0) {
+    if (s_pre_n >= CLOCK_MAX_TIMERS) { if (g_lv.task) g_lv.task->showAlert(TR("Preset list full"), 1800); return; }
+    if (s_edit_pre.dur_sec == 0) { if (g_lv.task) g_lv.task->showAlert(TR("Set a duration"), 1800); return; }
+    if (s_edit_name_ta) { const char* t = lv_textarea_get_text(s_edit_name_ta); strncpy(s_edit_pre.name, (t && t[0]) ? t : "Timer", sizeof s_edit_pre.name - 1); s_edit_pre.name[sizeof s_edit_pre.name - 1] = '\0'; }
+    s_pre[s_pre_n++] = s_edit_pre;
+    clockSaveTimers(s_pre, s_pre_n);
+    clockRebuildRuns();
+  }
+  clockCloseEdit();
+}
+static void clockEditDismissCb(lv_event_t* e) {
+  if (lv_event_get_target(e) != s_clock_edit_root) return;
+  clockCloseEdit();
+}
+// shared modal scaffold: backdrop + centred card; returns the card (caller fills it)
+static lv_obj_t* clockEditScaffold(int card_h, const char* title) {
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_clock_edit_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_clock_edit_root);
+  lv_obj_set_size(s_clock_edit_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_clock_edit_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_clock_edit_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_clock_edit_root, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_clock_edit_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_clock_edit_root, clockEditDismissCb, LV_EVENT_CLICKED, nullptr);
+  const lv_coord_t cw = (sw - 24 > 300) ? 300 : sw - 24;
+  if (card_h > sh - STATUSBAR_H - 16) card_h = sh - STATUSBAR_H - 16;
+  lv_obj_t* card = lv_obj_create(s_clock_edit_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, cw, card_h);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 8);
+  styleSurface(card, COLOR_PANEL, 8);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* t = lv_label_create(card);
+  lv_label_set_text(t, title);
+  lv_obj_set_style_text_font(t, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(t, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(t, 10, 8);
+  return card;
+}
+static void clockAddSaveCancel(lv_obj_t* card, int y) {
+  const lv_coord_t cw = lv_obj_get_width(card);
+  lv_obj_t* cancel = lv_btn_create(card);
+  lv_obj_set_size(cancel, (cw - 30) / 2, 34); lv_obj_set_pos(cancel, 10, y); styleButton(cancel);
+  lv_obj_add_event_cb(cancel, clockEditDismissCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* cl = lv_label_create(cancel); lv_label_set_text(cl, TR("Cancel")); lv_obj_center(cl);
+  lv_obj_t* save = lv_btn_create(card);
+  lv_obj_set_size(save, (cw - 30) / 2, 34); lv_obj_set_pos(save, cw - 10 - (cw - 30) / 2, y); styleButton(save);
+  lv_obj_set_style_bg_color(save, lv_color_hex(COLOR_STATUS_OK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(save, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(save, clockSaveEditCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* sl = lv_label_create(save); lv_label_set_text(sl, TR("Save")); lv_obj_center(sl);
+}
+static lv_obj_t* clockMakeNameField(lv_obj_t* card, int y, const char* ph) {
+  lv_obj_t* ta = lv_textarea_create(card);
+  lv_obj_set_size(ta, lv_obj_get_width(card) - 20, 34);
+  lv_obj_set_pos(ta, 10, y);
+  lv_textarea_set_one_line(ta, true);
+  lv_textarea_set_max_length(ta, sizeof(s_edit_alm.label) - 1);
+  lv_textarea_set_placeholder_text(ta, ph);
+  attachSettingsTaEvents(ta);
+  return ta;
+}
+static lv_obj_t* clockMakeRingRow(lv_obj_t* card, int y) {
+  lv_obj_t* c = lv_label_create(card);
+  lv_label_set_text(c, TR("Sound"));
+  lv_obj_set_style_text_font(c, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(c, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(c, 10, y);
+  lv_obj_t* btn = lv_btn_create(card);
+  lv_obj_set_size(btn, lv_obj_get_width(card) - 20, 32);
+  lv_obj_set_pos(btn, 10, y + 16);
+  styleButton(btn);
+  lv_obj_add_event_cb(btn, clockRingCycleCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* l = lv_label_create(btn); lv_obj_center(l);
+  s_edit_ring_lbl = l;
+  return btn;
+}
+static void clockOpenAddTimer() {
+  if (s_clock_edit_root) return;
+  s_edit_kind = 0;
+  s_edit_pre = ClockTimerPreset{};
+  s_edit_pre.dur_sec = 300;                // default 5:00
+  s_edit_pre.ringtone = RING_CHIME;
+  for (int i = 0; i < 4; ++i) s_edit_v[i] = nullptr;
+  s_edit_ring_lbl = nullptr;
+  lv_obj_t* card = clockEditScaffold(266, TR("New timer"));
+  s_edit_name_ta = clockMakeNameField(card, 36, TR("Name (e.g. Tea)"));
+  clockMakeStepper(card, 10,  78, 130, TR("Minutes"), CKF_A, &s_edit_v[0]);
+  clockMakeStepper(card, 150, 78, 130, TR("Seconds"), CKF_B, &s_edit_v[1]);
+  clockMakeRingRow(card, 138);
+  clockAddSaveCancel(card, 200);
+  clockEditUpdateVals();
+}
+static void clockOpenAddAlarm() {
+  if (s_clock_edit_root) return;
+  s_edit_kind = 1;
+  s_edit_alm = ClockAlarm{};
+  s_edit_alm.hour = 7; s_edit_alm.minute = 0;
+  s_edit_alm.ringtone = RING_CHIME; s_edit_alm.enabled = 1;
+  for (int i = 0; i < 4; ++i) s_edit_v[i] = nullptr;
+  for (int i = 0; i < 7; ++i) s_edit_day[i] = nullptr;
+  s_edit_ring_lbl = nullptr;
+  lv_obj_t* card = clockEditScaffold(316, TR("New alarm"));
+  const lv_coord_t cw = lv_obj_get_width(card);
+  clockMakeStepper(card, 10,  36, 130, TR("Hour"),   CKF_A, &s_edit_v[0]);
+  clockMakeStepper(card, 150, 36, 130, TR("Minute"), CKF_B, &s_edit_v[1]);
+  // weekday toggles (one-time if none selected)
+  static const char* kDay = "SMTWTFS";
+  const int dw = (cw - 20) / 7;
+  for (int b = 0; b < 7; ++b) {
+    lv_obj_t* d = lv_btn_create(card);
+    lv_obj_set_size(d, dw - 2, 30);
+    lv_obj_set_pos(d, 10 + b * dw, 96);
+    styleButton(d);
+    lv_obj_add_flag(d, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(d, clockDayCb, LV_EVENT_CLICKED, (void*)(intptr_t)b);
+    char ds[2] = { kDay[b], 0 };
+    lv_obj_t* dl = lv_label_create(d); lv_label_set_text(dl, ds); lv_obj_center(dl);
+    s_edit_day[b] = d;
+  }
+  s_edit_name_ta = clockMakeNameField(card, 134, TR("Label (e.g. Wake up)"));
+  clockMakeRingRow(card, 176);
+  clockAddSaveCancel(card, 250);
+  clockEditUpdateVals();
+}
+static void clockZonePickCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (s_world_n >= CLOCK_MAX_WORLD) { if (g_lv.task) g_lv.task->showAlert(TR("World-clock list full"), 1800); clockCloseEdit(); return; }
+  ClockWorldEntry w = {};
+  w.tz_index = (uint8_t)idx;
+  s_world[s_world_n++] = w;
+  clockSaveWorld(s_world, s_world_n);
+  clockRebuildWorld();
+  clockCloseEdit();
+}
+static void clockOpenZonePicker() {
+  if (s_clock_edit_root) return;
+  s_edit_kind = 2;
+  lv_obj_t* card = clockEditScaffold(lv_disp_get_ver_res(nullptr) - STATUSBAR_H - 16, TR("Add time zone"));
+  lv_obj_t* list = lv_obj_create(card);
+  lv_obj_remove_style_all(list);
+  lv_obj_set_size(list, lv_obj_get_width(card) - 16, lv_obj_get_height(card) - 44);
+  lv_obj_set_pos(list, 8, 36);
+  lv_obj_set_scroll_dir(list, LV_DIR_VER);
+  lv_obj_set_style_pad_row(list, 4, LV_PART_MAIN);
+  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+  const int n = touchPrefsTimezoneCount() - 1;   // exclude the trailing "Custom" slot
+  for (int i = 0; i < n; ++i) {
+    lv_obj_t* b = lv_btn_create(list);
+    lv_obj_set_size(b, lv_obj_get_width(card) - 24, 34);
+    styleButton(b);
+    lv_obj_add_event_cb(b, clockZonePickCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, touchPrefsTimezoneLabel(i));
+    lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
+    lv_obj_align(l, LV_ALIGN_LEFT_MID, 6, 0);
+  }
+}
+static void clockCloseEdit() {
+  hideKb();
+  if (s_clock_edit_root) { lv_obj_del_async(s_clock_edit_root); s_clock_edit_root = nullptr; }
+  s_edit_name_ta = nullptr; s_edit_ring_lbl = nullptr;
+  for (int i = 0; i < 4; ++i) s_edit_v[i] = nullptr;
+  for (int i = 0; i < 7; ++i) s_edit_day[i] = nullptr;
+}
+
+// ---- ring overlay (a fired alarm/timer) ----
+static void clockRingStopCb(lv_event_t* e)   { if (lv_event_get_code(e) == LV_EVENT_CLICKED) clockCloseRing(false); }
+static void clockRingSnoozeCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) clockCloseRing(true); }
+static bool clockOpenRing(const char* title, bool is_alarm, int alm_idx, uint8_t tone) {
+  if (s_ring_active) return false;         // one ring at a time — caller must NOT commit its event yet
+  s_ring_active = true; s_ring_tone = tone; s_ring_is_alarm = is_alarm; s_ring_alm = alm_idx;
+  s_ring_t0 = millis(); s_ring_last = 0;
+  if (g_lv.task) g_lv.task->wakeScreen();
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_clock_ring_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_clock_ring_root);
+  lv_obj_set_size(s_clock_ring_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_clock_ring_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_clock_ring_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_clock_ring_root, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(s_clock_ring_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_move_foreground(s_clock_ring_root);
+  lv_obj_t* ic = lv_label_create(s_clock_ring_root);
+  lv_label_set_text(ic, TOUCH_SYM_CLOCK);
+  lv_obj_set_style_text_font(ic, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(ic, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_align(ic, LV_ALIGN_TOP_MID, 0, 24);
+  lv_obj_t* tl = lv_label_create(s_clock_ring_root);
+  lv_label_set_text(tl, title);
+  lv_obj_set_style_text_font(tl, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(tl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_width(tl, sw - 24);
+  lv_obj_set_style_text_align(tl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 54);
+  s_clk_ring_time = lv_label_create(s_clock_ring_root);
+  lv_obj_set_style_text_font(s_clk_ring_time, &lv_font_montserrat_28, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_clk_ring_time, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_align(s_clk_ring_time, LV_ALIGN_CENTER, 0, -6);
+  lv_obj_t* stop = lv_btn_create(s_clock_ring_root);
+  lv_obj_set_size(stop, 120, 44);
+  styleButton(stop);
+  lv_obj_set_style_bg_color(stop, lv_color_hex(0xE05544), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(stop, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_event_cb(stop, clockRingStopCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* sl = lv_label_create(stop); lv_label_set_text(sl, TR("Stop")); lv_obj_center(sl);
+  if (is_alarm) {
+    lv_obj_align(stop, LV_ALIGN_BOTTOM_MID, 64, -16);
+    lv_obj_t* sn = lv_btn_create(s_clock_ring_root);
+    lv_obj_set_size(sn, 120, 44); lv_obj_align(sn, LV_ALIGN_BOTTOM_MID, -64, -16); styleButton(sn);
+    lv_obj_add_event_cb(sn, clockRingSnoozeCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* snl = lv_label_create(sn); lv_label_set_text(snl, TR("Snooze")); lv_obj_center(snl);
+  } else {
+    lv_obj_align(stop, LV_ALIGN_BOTTOM_MID, 0, -16);
+  }
+  clockPlayRingtone(tone);
+  s_ring_last = millis();
+  return true;
+}
+static void clockCloseRing(bool snooze) {
+  if (snooze && s_ring_is_alarm && s_ring_alm >= 0 && s_ring_alm < s_alm_n)
+    s_alm_snooze[s_ring_alm] = (uint32_t)time(nullptr) + 540;   // +9 min
+  s_ring_active = false; s_ring_alm = -1; s_clk_ring_time = nullptr;
+  if (s_clock_ring_root) { lv_obj_del_async(s_clock_ring_root); s_clock_ring_root = nullptr; }
+}
+
+// ---- always-on background service (called every loop iteration) ----
+static void clockServiceTick(uint32_t now_epoch) {
+  clockEnsureLoaded();
+  const uint32_t ms = millis();
+  // ring controller: re-trigger the melody + keep the screen awake; auto-stop at 60 s.
+  if (s_ring_active) {
+    if (ms - s_ring_t0 >= CLOCK_RING_MAX_MS) { clockCloseRing(false); }
+    else {
+      if (ms - s_ring_last >= CLOCK_RING_REP_MS) { clockPlayRingtone(s_ring_tone); s_ring_last = ms; if (g_lv.task) g_lv.task->wakeScreen(); }
+      if (s_clk_ring_time) {
+        time_t t = (time_t)now_epoch; struct tm lt; char hm[12];
+        if (now_epoch > 1700000000) { localtime_r(&t, &lt); fmtClockHM(hm, sizeof hm, &lt); } else snprintf(hm, sizeof hm, "--:--");
+        lv_label_set_text(s_clk_ring_time, hm);
+      }
+    }
+  }
+  // 1 Hz gate for the timer/alarm scans
+  static uint32_t s_last_chk = 0;
+  if (ms - s_last_chk < 1000) return;
+  s_last_chk = ms;
+  // countdown expiry. Only commit (mark inactive) when the ring actually opens —
+  // otherwise a ring is already up, so leave the run pending and retry next tick.
+  bool runs_changed = false;
+  for (int i = 0; i < CLOCK_MAX_RUN; ++i) {
+    if (!s_run[i].active) continue;
+    if (now_epoch >= s_run[i].end_epoch) {
+      char title[40]; snprintf(title, sizeof title, "%s — %s", TR("Timer"), s_run[i].name);
+      if (clockOpenRing(title, false, -1, s_run[i].ringtone)) { s_run[i].active = false; runs_changed = true; }
+    }
+  }
+  if (runs_changed && clockUiOpen() && s_clk_run_box) clockRebuildRuns();
+  // alarms (need a real wall clock)
+  if (now_epoch <= 1700000000) return;
+  time_t t = (time_t)now_epoch; struct tm lt; localtime_r(&t, &lt);
+  const uint32_t key = ((uint32_t)lt.tm_yday << 16) | (uint32_t)(lt.tm_hour * 60 + lt.tm_min);
+  bool alarms_changed = false;
+  for (int i = 0; i < s_alm_n; ++i) {
+    const bool snooze_due = (s_alm_snooze[i] && now_epoch >= s_alm_snooze[i]);
+    const bool time_due   = (s_alm[i].enabled && lt.tm_hour == s_alm[i].hour && lt.tm_min == s_alm[i].minute &&
+                             s_alm_guard[i] != key && (s_alm[i].days_mask == 0 || (s_alm[i].days_mask & (1 << lt.tm_wday))));
+    if (!snooze_due && !time_due) continue;
+    char title[48]; snprintf(title, sizeof title, "%s — %s", TR("Alarm"), s_alm[i].label[0] ? s_alm[i].label : "");
+    // Commit the consuming side-effects ONLY if the ring opened; if one is already
+    // up, leave snooze/guard/enable untouched so this alarm re-fires once it clears.
+    if (!clockOpenRing(title, true, i, s_alm[i].ringtone)) continue;
+    if (snooze_due) s_alm_snooze[i] = 0;
+    if (time_due) {
+      s_alm_guard[i] = key;
+      if (s_alm[i].days_mask == 0) { s_alm[i].enabled = 0; alarms_changed = true; }   // one-time → disable
+    }
+  }
+  if (alarms_changed) { clockSaveAlarms(s_alm, s_alm_n); if (clockUiOpen() && s_clk_alm_box) clockRebuildAlarms(); }
+}
+
+// ---- subtab switching + window tick ----
+static void clockShowSub(int i) {
+  if (i < 0 || i > 3) return;
+  s_clock_active = i;
+  for (int k = 0; k < 4; ++k) {
+    if (s_clk_sub[k]) { if (k == i) lv_obj_clear_flag(s_clk_sub[k], LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(s_clk_sub[k], LV_OBJ_FLAG_HIDDEN); }
+    if (s_clk_seg[k]) {
+      if (k == i) { lv_obj_set_style_bg_color(s_clk_seg[k], lv_color_hex(COLOR_ACCENT), LV_PART_MAIN); lv_obj_set_style_bg_opa(s_clk_seg[k], LV_OPA_COVER, LV_PART_MAIN); }
+      else        { lv_obj_set_style_bg_color(s_clk_seg[k], lv_color_hex(COLOR_ACCENT), LV_PART_MAIN); lv_obj_set_style_bg_opa(s_clk_seg[k], LV_OPA_20, LV_PART_MAIN); }
+    }
+  }
+  clockRefreshLocal();
+  if (i == 0) clockRefreshWorld();
+  else if (i == 1) clockRefreshRuns();
+  else if (i == 3) clockRefreshStopwatch();
+}
+static void clockSegCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  clockShowSub((int)(intptr_t)lv_event_get_user_data(e));
+}
+static void clockTickCb(lv_timer_t*) {
+  if (!s_clock_root) return;
+  static uint32_t last_sec = 0;
+  const uint32_t ms = millis();
+  if (s_clock_active == 3) clockRefreshStopwatch();   // ~10 Hz for centiseconds
+  if (ms - last_sec >= 1000) {
+    last_sec = ms;
+    clockRefreshLocal();
+    if (s_clock_active == 0) clockRefreshWorld();
+    else if (s_clock_active == 1) clockRefreshRuns();
+  }
+}
+
+// ---- add-button callbacks (top of Timers / Alarms / World subtabs) ----
+static void clockAddZoneBtnCb(lv_event_t* e)  { if (lv_event_get_code(e) == LV_EVENT_CLICKED) clockOpenZonePicker(); }
+static void clockAddTimerBtnCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) clockOpenAddTimer(); }
+static void clockAddAlarmBtnCb(lv_event_t* e) { if (lv_event_get_code(e) == LV_EVENT_CLICKED) clockOpenAddAlarm(); }
+
+static lv_obj_t* clockMakeSub(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h) {
+  lv_obj_t* s = lv_obj_create(parent);
+  lv_obj_remove_style_all(s);
+  lv_obj_set_size(s, w, h);
+  lv_obj_set_pos(s, x, y);
+  lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+  return s;
+}
+static lv_obj_t* clockMakeScrollBox(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h) {
+  lv_obj_t* b = lv_obj_create(parent);
+  lv_obj_remove_style_all(b);
+  lv_obj_set_size(b, w, h);
+  lv_obj_set_pos(b, x, y);
+  lv_obj_set_scroll_dir(b, LV_DIR_VER);
+  lv_obj_set_flex_flow(b, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(b, 4, LV_PART_MAIN);
+  return b;
+}
+static lv_obj_t* clockMakeAddBtn(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, const char* txt, lv_event_cb_t cb) {
+  lv_obj_t* b = lv_btn_create(parent);
+  lv_obj_set_size(b, w, 30); lv_obj_set_pos(b, x, y); styleButton(b);
+  lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* l = lv_label_create(b); lv_label_set_text(l, txt); lv_obj_center(l);
+  return b;
+}
+
+static void clockCloseAppCb(lv_event_t* e) { (void)e; closeClockApp(); }
+static void clockAppDismissCb(lv_event_t* e) { if (lv_event_get_target(e) == s_clock_root) closeClockApp(); }
+
+static void openClockApp() {
+  if (s_clock_root) return;
+  clockEnsureLoaded();
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_clock_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_clock_root);
+  lv_obj_set_size(s_clock_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_clock_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_clock_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_clock_root, LV_OPA_50, LV_PART_MAIN);
+  lv_obj_clear_flag(s_clock_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_clock_root, clockAppDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  const lv_coord_t cardw = sw - 12;
+  const lv_coord_t cardh = sh - STATUSBAR_H - 10;
+  lv_obj_t* card = lv_obj_create(s_clock_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, cardw, cardh);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 5);
+  styleSurface(card, COLOR_PANEL, 8);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  addCloseXBadge(card, clockCloseAppCb);
+
+  lv_obj_t* title = lv_label_create(card);
+  lv_label_set_text(title, TOUCH_SYM_CLOCK "  Clock");
+  lv_obj_set_style_text_font(title, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(title, 10, 6);
+
+  // segmented bar
+  static const char* kSeg[4] = { "World", "Timers", "Alarms", "Watch" };
+  const lv_coord_t segw = (cardw - 8) / 4;
+  for (int i = 0; i < 4; ++i) {
+    lv_obj_t* b = lv_btn_create(card);
+    lv_obj_set_size(b, segw - 2, 28);
+    lv_obj_set_pos(b, 4 + i * segw, 30);
+    lv_obj_set_style_radius(b, 4, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(b, LV_OPA_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(b, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_add_event_cb(b, clockSegCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    lv_obj_t* l = lv_label_create(b); lv_label_set_text(l, kSeg[i]);
+    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN); lv_obj_center(l);
+    s_clk_seg[i] = b;
+  }
+
+  const lv_coord_t cy = 64;
+  const lv_coord_t cw = cardw;
+  const lv_coord_t ch = cardh - cy - 4;
+  for (int i = 0; i < 4; ++i) s_clk_sub[i] = clockMakeSub(card, 0, cy, cw, ch);
+
+  // --- World ---
+  {
+    lv_obj_t* p = s_clk_sub[0];
+    s_clk_local_lbl = lv_label_create(p);
+    lv_obj_set_style_text_font(s_clk_local_lbl, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_clk_local_lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_label_set_text(s_clk_local_lbl, "--:--:--");
+    lv_obj_align(s_clk_local_lbl, LV_ALIGN_TOP_MID, 0, 4);
+    s_clk_date_lbl = lv_label_create(p);
+    lv_obj_set_style_text_font(s_clk_date_lbl, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_clk_date_lbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_label_set_text(s_clk_date_lbl, "");
+    lv_obj_align(s_clk_date_lbl, LV_ALIGN_TOP_MID, 0, 40);
+    clockMakeAddBtn(p, 6, 58, cw - 12, TR("+ Add time zone"), clockAddZoneBtnCb);
+    s_clk_world_box = clockMakeScrollBox(p, 4, 92, cw - 8, ch - 96);
+  }
+  // --- Timers (one scroll: Running header + rows + "New preset" + Presets header + rows) ---
+  {
+    lv_obj_t* p = s_clk_sub[1];
+    s_clk_run_box = clockMakeScrollBox(p, 4, 2, cw - 8, ch - 6);
+  }
+  // --- Alarms ---
+  {
+    lv_obj_t* p = s_clk_sub[2];
+    clockMakeAddBtn(p, 6, 2, cw - 12, TR("+ New alarm"), clockAddAlarmBtnCb);
+    s_clk_alm_box = clockMakeScrollBox(p, 4, 38, cw - 8, ch - 42);
+  }
+  // --- Stopwatch ---
+  {
+    lv_obj_t* p = s_clk_sub[3];
+    s_clk_sw_lbl = lv_label_create(p);
+    lv_obj_set_style_text_font(s_clk_sw_lbl, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_clk_sw_lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_label_set_text(s_clk_sw_lbl, "00:00:00.00");
+    lv_obj_align(s_clk_sw_lbl, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_t* ss = lv_btn_create(p);
+    lv_obj_set_size(ss, (cw - 24) / 2, 38); lv_obj_set_pos(ss, 8, 54); styleButton(ss);
+    lv_obj_add_event_cb(ss, clockSwStartStopCb, LV_EVENT_CLICKED, nullptr);
+    s_clk_sw_run_lbl = lv_label_create(ss); lv_label_set_text(s_clk_sw_run_lbl, s_sw_run ? TR("Stop") : TR("Start")); lv_obj_center(s_clk_sw_run_lbl);
+    lv_obj_t* rl = lv_btn_create(p);
+    lv_obj_set_size(rl, (cw - 24) / 2, 38); lv_obj_set_pos(rl, cw - 8 - (cw - 24) / 2, 54); styleButton(rl);
+    lv_obj_add_event_cb(rl, clockSwResetLapCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* rll = lv_label_create(rl); lv_label_set_text(rll, TR("Lap / Reset")); lv_obj_center(rll);
+    s_clk_sw_lapbox = clockMakeScrollBox(p, 4, 100, cw - 8, ch - 104);
+  }
+
+  clockRebuildWorld();
+  clockRebuildRuns();
+  clockRebuildAlarms();
+  clockSwRebuildLaps();
+  clockShowSub(0);
+  clockRefreshLocal();
+  clockRefreshStopwatch();
+  if (!s_clk_tick) s_clk_tick = lv_timer_create(clockTickCb, 100, nullptr);
+}
+static void closeClockApp() {
+  if (s_clk_tick) { lv_timer_del(s_clk_tick); s_clk_tick = nullptr; }
+  if (s_clock_root) { lv_obj_del_async(s_clock_root); s_clock_root = nullptr; }
+  for (int i = 0; i < 4; ++i) { s_clk_seg[i] = nullptr; s_clk_sub[i] = nullptr; }
+  for (int i = 0; i < CLOCK_MAX_WORLD; ++i) s_clk_world_t[i] = nullptr;
+  for (int i = 0; i < CLOCK_MAX_RUN; ++i)   s_clk_run_lbl[i]  = nullptr;
+  s_clk_local_lbl = s_clk_date_lbl = s_clk_world_box = nullptr;
+  s_clk_run_box = s_clk_alm_box = nullptr;
+  s_clk_sw_lbl = s_clk_sw_lapbox = s_clk_sw_run_lbl = nullptr;
+}
+
 static void appTileCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   const int act = (int)(intptr_t)lv_event_get_user_data(e);
@@ -22026,6 +23089,7 @@ static void appTileCb(lv_event_t* e) {
     case APPACT_ADVERT:    openAdvertModalCb(e);  return;
     case APPACT_POWER:     openPowerMenu();      return;
     case APPACT_SNAKE:     SnakeGame::launch();  return;
+    case APPACT_CLOCK:     openClockApp();       return;   // overlay app (keeps the drawer underneath)
 #if defined(HAS_TDECK_GT911)
     case APPACT_TERMINAL:  homeTerminalCb(e);    return;
     case APPACT_FILES:     homeFilesCb(e);       return;
@@ -22211,6 +23275,7 @@ static void openAppDrawer() {
     { LV_SYMBOL_DIRECTORY, "Files",     APPACT_FILES,    0,         0xE6BE4A },      // folder gold
 #endif
     { nullptr,             "Snake",     APPACT_SNAKE,    0,         0x53C06B },      // snake game (icon drawn from APPACT_SNAKE, not a glyph)
+    { TOUCH_SYM_CLOCK,     "Clock",     APPACT_CLOCK,    0,         0xFFC107 },      // world clock / timers / alarms / stopwatch (amber)
     { LV_SYMBOL_POWER,     "Power",     APPACT_POWER,    0,         0xE05544 },      // power red
   };
   const int n = (int)(sizeof(tiles) / sizeof(tiles[0]));
@@ -27686,6 +28751,7 @@ void UITask::loop() {
   }
 
   batteryLogTick((uint32_t)now);   // 5-min battery sample (SD on T-Deck, else SPIFFS)
+  clockServiceTick((uint32_t)time(nullptr));   // Clock app: countdown expiry + alarm firing + ring controller (works window-closed)
 #if defined(HAS_TDECK_GT911)
   telemetryPollTick((uint32_t)now); // auto-poll due nodes -> log (no window)
 #endif

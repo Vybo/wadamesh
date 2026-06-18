@@ -315,6 +315,12 @@ void        touchPrefsSetTimezone(uint8_t idx);
  *  `out` is always null-terminated when out_cap > 0. */
 void touchPrefsBuildLocalTz(char* out, int out_cap);
 
+/** POSIX TZ string for an arbitrary preset index (NOT the selected zone) — used
+ *  by the Clock app's world-clock rows to resolve each zone independently of the
+ *  device's own time zone. Returns false for the "Custom" slot (no fixed POSIX
+ *  string) and for out-of-range indices; `out` is null-terminated when it fits. */
+bool touchPrefsTimezonePosix(int idx, char* out, int out_cap);
+
 /** First-boot setup wizard completion flag. false until the user finishes (or
  *  skips) the on-device setup flow (welcome → name → region → Wi-Fi); true
  *  thereafter so the wizard never reappears on subsequent boots. */
