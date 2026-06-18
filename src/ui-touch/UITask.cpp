@@ -9392,6 +9392,21 @@ static void pathsRebuild() {
   }
   y += 6;
 
+  // Heads-up: out_path is auto-learned — onContactPathRecv() overwrites it
+  // whenever the contact's next reply carries a return path, so a custom path
+  // set here is a starting override, not a permanent lock. The Current route
+  // above always reflects the live out_path (auto-learned or manual).
+  {
+    lv_obj_t* note = lv_label_create(s_paths_body);
+    lv_label_set_text(note, TR("Mesh may auto-replace this route after a reply."));
+    lv_obj_set_style_text_font(note, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(note, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, cw);
+    lv_obj_set_pos(note, 0, y);
+    y += 32;
+  }
+
   // Reset to flood button
   lv_obj_t* rb = lv_btn_create(s_paths_body);
   lv_obj_set_size(rb, cw, 30);
