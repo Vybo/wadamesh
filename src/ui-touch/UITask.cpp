@@ -8979,7 +8979,26 @@ static void openPathsWindow(uint32_t mesh_idx);          // Paths screen (define
 static void pathsRebuild();                              // repaint body sections
 static void pathsRebuildResults();
 static void pathsEditorClear();
+static void pathsReloadPresets();
+static inline uint8_t pathsActiveHashSize();
 static void actionSheetPathsCb(lv_event_t* e);
+
+// ---- Per-node path presets (/meshcomod/paths) --------------------------------
+// One file per node (6-byte pubkey prefix). SD on T-Deck (else SPIFFS, with a
+// short flat name for SPIFFS's 31-char limit). Line: name\t<enc_len>\t<hex>\n
+static constexpr int k_path_preset_max = 12;
+static constexpr int k_path_name_cap   = 24;
+struct PathPreset {
+  char    name[k_path_name_cap + 1];
+  uint8_t enc_len;                  // packed out_path_len
+  uint8_t bytes[MAX_PATH_SIZE];     // raw out_path
+  uint8_t nbytes;
+};
+// I/O function bodies are defined after telemetryNodePath (where battLogFs is in scope).
+static fs::FS& pathsFs();
+static void pathsFilePath(const uint8_t* key, char* out, size_t cap);
+static int  pathPresetsLoad(const uint8_t* key, PathPreset* out, int max);
+static bool pathPresetsSave(const uint8_t* key, const PathPreset* arr, int n);
 
 // ===== Paths window (per-node explicit route + presets) =====================
 static lv_obj_t* s_paths_root    = nullptr;   // full-screen overlay
@@ -8990,9 +9009,10 @@ static uint8_t   s_paths_pub[32] = {0};       // its pubkey (stable across edits
 // editor statics (defined/initialized in the editor block below pathResolveHop)
 static lv_obj_t* s_pe_ta         = nullptr;   // add-hop search textarea
 static lv_obj_t* s_pe_results    = nullptr;   // live-search results list
+static lv_obj_t* s_paths_save_ta = nullptr;   // preset name textarea (nulled on close)
 
 static void closePathsWindow() {
-  if (s_paths_root) { lv_obj_del_async(s_paths_root); s_paths_root = nullptr; s_paths_card = nullptr; s_pe_ta = nullptr; s_pe_results = nullptr; s_paths_body = nullptr; }
+  if (s_paths_root) { lv_obj_del_async(s_paths_root); s_paths_root = nullptr; s_paths_card = nullptr; s_pe_ta = nullptr; s_pe_results = nullptr; s_paths_body = nullptr; s_paths_save_ta = nullptr; }
 }
 static void pathsWindowCloseCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -9063,6 +9083,7 @@ static void openPathsWindow(uint32_t mesh_idx) {
   lv_obj_set_pos(title, 0, 0);
 
   s_paths_body = nullptr;
+  pathsReloadPresets();
   pathsEditorClear();
   pathsRebuild();
 }
@@ -9081,6 +9102,75 @@ static uint8_t s_pe_hops[63][3] = {{0}};
 static uint8_t s_pe_n = 0;
 
 static void pathsEditorClear() { s_pe_n = 0; }
+
+static PathPreset s_paths_presets[k_path_preset_max];
+static int        s_paths_preset_n = 0;
+
+static void pathsReloadPresets() { s_paths_preset_n = pathPresetsLoad(s_paths_pub, s_paths_presets, k_path_preset_max); }
+
+static void pathsApplyPresetCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_paths_preset_n) return;
+  const PathPreset& p = s_paths_presets[i];
+  bool ok = (p.enc_len == OUT_PATH_UNKNOWN || (p.enc_len & 63) == 0)
+            ? the_mesh.uiResetContactPath(s_paths_pub)
+            : the_mesh.uiSetContactPath(s_paths_pub, p.bytes, p.enc_len);
+  refreshContactsList();
+  if (g_lv.task) g_lv.task->showAlert(ok ? TR("Preset applied") : TR("Apply failed"), 1000);
+  pathsRebuild();
+}
+static void pathsLoadPresetCb(lv_event_t* e) {           // load preset into editor
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_paths_preset_n) return;
+  const PathPreset& p = s_paths_presets[i];
+  const uint8_t hs = (uint8_t)((p.enc_len >> 6) + 1);
+  const uint8_t hops = (uint8_t)(p.enc_len & 63);
+  s_pe_n = 0;
+  for (uint8_t k = 0; k < hops && s_pe_n < 63; ++k) {
+    uint8_t b[3] = {0}; for (uint8_t z = 0; z < hs && z < 3; ++z) b[z] = p.bytes[k * hs + z];
+    memcpy(s_pe_hops[s_pe_n++], b, 3);
+  }
+  pathsRebuild();
+}
+static void pathsDelPresetCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_paths_preset_n) return;
+  for (int k = i; k < s_paths_preset_n - 1; ++k) s_paths_presets[k] = s_paths_presets[k + 1];
+  --s_paths_preset_n;
+  pathPresetsSave(s_paths_pub, s_paths_presets, s_paths_preset_n);
+  pathsRebuild();
+}
+// Save current editor path under the typed name (overwrites same name).
+static void pathsSavePresetCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_paths_save_ta) return;
+  kbMirrorSyncToReal();
+  if (s_pe_n == 0) { if (g_lv.task) g_lv.task->showAlert(TR("Build a path first"), 1200); return; }
+  char nm[k_path_name_cap + 1];
+  strncpy(nm, lv_textarea_get_text(s_paths_save_ta), k_path_name_cap); nm[k_path_name_cap] = '\0';
+  for (int i = (int)strlen(nm) - 1; i >= 0 && (nm[i]==' '||nm[i]=='\t'); --i) nm[i] = '\0';
+  for (char* p = nm; *p; ++p) if (*p == '\t') *p = ' ';     // tabs are the field separator
+  if (!nm[0]) { if (g_lv.task) g_lv.task->showAlert(TR("Name the preset"), 1200); return; }
+
+  const uint8_t hs = pathsActiveHashSize();
+  PathPreset np{}; strncpy(np.name, nm, k_path_name_cap); np.name[k_path_name_cap] = '\0';
+  np.enc_len = (uint8_t)(((hs - 1) << 6) | (s_pe_n & 63));
+  np.nbytes = 0;
+  for (int i = 0; i < s_pe_n; ++i) for (int b = 0; b < hs; ++b) np.bytes[np.nbytes++] = s_pe_hops[i][b];
+
+  int slot = -1;
+  for (int i = 0; i < s_paths_preset_n; ++i) if (strcmp(s_paths_presets[i].name, np.name) == 0) { slot = i; break; }
+  if (slot < 0) {
+    if (s_paths_preset_n >= k_path_preset_max) { if (g_lv.task) g_lv.task->showAlert(TR("Preset slots full"), 1300); return; }
+    slot = s_paths_preset_n++;
+  }
+  s_paths_presets[slot] = np;
+  bool ok = pathPresetsSave(s_paths_pub, s_paths_presets, s_paths_preset_n);
+  if (g_lv.task) g_lv.task->showAlert(ok ? TR("Preset saved") : TR("Save failed"), 1000);
+  pathsRebuild();
+}
 
 static inline uint8_t pathsActiveHashSize() {
   NodePrefs* p = the_mesh.getNodePrefs();
@@ -9352,7 +9442,42 @@ static void pathsRebuild() {
   lv_obj_add_event_cb(applyb, pathsApplyCb, LV_EVENT_CLICKED, nullptr);
   { lv_obj_t* l = lv_label_create(applyb); lv_label_set_text(l, TR("Apply path")); lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN); lv_obj_center(l); }
   y += 38;
-  // >>> Task 5 inserts the Presets section here <<<
+  // ---- Presets (this node) ----
+  y += 4;
+  section("Presets");
+  for (int i = 0; i < s_paths_preset_n; ++i) {
+    const PathPreset& p = s_paths_presets[i];
+    const uint8_t hops = (uint8_t)(p.enc_len & 63);
+    char txt[48]; snprintf(txt, sizeof txt, "%s  (%uh)", p.name, hops);
+    lv_obj_t* l = lv_label_create(s_paths_body);
+    lv_label_set_text(l, txt); lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT); lv_obj_set_width(l, cw - 84); lv_obj_set_pos(l, 0, y + 4);
+    auto mkmini = [&](const char* sym, lv_event_cb_t cb, int xoff, uint32_t bg) {
+      lv_obj_t* b = lv_btn_create(s_paths_body); lv_obj_set_size(b, 24, 24);
+      lv_obj_set_pos(b, cw - 84 + xoff, y); styleButton(b);
+      if (bg) lv_obj_set_style_bg_color(b, lv_color_hex(bg), LV_PART_MAIN);
+      lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+      lv_obj_t* lb = lv_label_create(b); lv_label_set_text(lb, sym);
+      lv_obj_set_style_text_font(lb, &g_font_12, LV_PART_MAIN); lv_obj_center(lb);
+    };
+    mkmini(LV_SYMBOL_PLAY,  pathsApplyPresetCb, 0,  0x1F6F3A);   // apply
+    mkmini(LV_SYMBOL_EDIT,  pathsLoadPresetCb,  28, 0);          // load to editor
+    mkmini(LV_SYMBOL_TRASH, pathsDelPresetCb,   56, 0);          // delete
+    y += 28;
+  }
+  // save-current-as-preset row
+  y += 2;
+  s_paths_save_ta = lv_textarea_create(s_paths_body);
+  lv_textarea_set_one_line(s_paths_save_ta, true);
+  lv_textarea_set_placeholder_text(s_paths_save_ta, TR("preset name"));
+  lv_obj_set_size(s_paths_save_ta, cw - 90, 30); lv_obj_set_pos(s_paths_save_ta, 0, y);
+  if (g_lv.keyboard) kbMirrorBind(s_paths_save_ta);
+  lv_obj_t* savb = lv_btn_create(s_paths_body);
+  lv_obj_set_size(savb, 84, 30); lv_obj_set_pos(savb, cw - 84, y); styleButton(savb);
+  lv_obj_add_event_cb(savb, pathsSavePresetCb, LV_EVENT_CLICKED, nullptr);
+  { lv_obj_t* l = lv_label_create(savb); lv_label_set_text(l, TR("Save")); lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN); lv_obj_center(l); }
+  y += 36;
 }
 
 static void actionSheetPathsCb(lv_event_t* e) {
@@ -10810,6 +10935,58 @@ static void batteryTapCb(lv_event_t* e) {
   openBatteryChartWindow();
 }
 
+// ---- Per-node path preset file I/O (/meshcomod/paths) -----------------------
+// Uses battLogFs()/battLogOnSd() so must appear after those helpers but outside
+// any #if HAS_TDECK_GT911 guard (presets work on both boards via SPIFFS fallback).
+static fs::FS& pathsFs() { return battLogFs(); }
+static void pathsFilePath(const uint8_t* key, char* out, size_t cap) {
+  if (battLogOnSd())
+    snprintf(out, cap, "/meshcomod/paths/%02X%02X%02X%02X%02X%02X.cfg", key[0],key[1],key[2],key[3],key[4],key[5]);
+  else
+    snprintf(out, cap, "/p_%02X%02X%02X%02X%02X%02X.cfg", key[0],key[1],key[2],key[3],key[4],key[5]);
+}
+static int pathPresetsLoad(const uint8_t* key, PathPreset* out, int max) {
+  char path[48]; pathsFilePath(key, path, sizeof path);
+  File f = pathsFs().open(path, FILE_READ);
+  if (!f) return 0;
+  int n = 0;
+  while (f.available() && n < max) {
+    String ln = f.readStringUntil('\n'); ln.trim();
+    int t1 = ln.indexOf('\t'); if (t1 < 1) continue;
+    int t2 = ln.indexOf('\t', t1 + 1); if (t2 < 0) continue;
+    PathPreset& p = out[n];
+    String nm = ln.substring(0, t1);
+    strncpy(p.name, nm.c_str(), k_path_name_cap); p.name[k_path_name_cap] = '\0';
+    p.enc_len = (uint8_t)ln.substring(t1 + 1, t2).toInt();
+    String hx = ln.substring(t2 + 1); hx.trim();
+    int nb = 0; const char* h = hx.c_str(); int hl = hx.length();
+    if (hl & 1) continue;
+    auto v = [](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return 10+(c-'a'); if(c>='A'&&c<='F')return 10+(c-'A'); return -1; };
+    bool ok = true;
+    for (int i=0;i<hl/2 && nb<MAX_PATH_SIZE;++i){ int hi=v(h[i*2]),lo=v(h[i*2+1]); if(hi<0||lo<0){ok=false;break;} p.bytes[nb++]=(uint8_t)((hi<<4)|lo); }
+    if (!ok) continue;
+    p.nbytes = (uint8_t)nb; ++n;
+  }
+  f.close();
+  return n;
+}
+static bool pathPresetsSave(const uint8_t* key, const PathPreset* arr, int n) {
+#if defined(HAS_TDECK_GT911)
+  if (battLogOnSd()) { markSdIo(); SD.mkdir("/meshcomod"); SD.mkdir("/meshcomod/paths"); }
+#endif
+  char path[48]; pathsFilePath(key, path, sizeof path);
+  pathsFs().remove(path);                       // fresh file (avoids stale tail)
+  File f = pathsFs().open(path, FILE_WRITE);
+  if (!f) return false;
+  for (int i = 0; i < n; ++i) {
+    f.printf("%s\t%u\t", arr[i].name, (unsigned)arr[i].enc_len);
+    for (int b = 0; b < arr[i].nbytes; ++b) f.printf("%02X", arr[i].bytes[b]);
+    f.print('\n');
+  }
+  f.close();
+  return true;
+}
+
 #if defined(HAS_TDECK_GT911)
 // ----- Per-node telemetry log (/meshcomod/telemetry/<id>.log) -----
 // One file per node (6-byte pubkey prefix, hex). Columns (tab-separated):
@@ -10822,6 +10999,7 @@ static void telemetryNodePath(const uint8_t* key, char* out, size_t cap) {
   snprintf(out, cap, "/meshcomod/telemetry/%02X%02X%02X%02X%02X%02X.log",
            key[0], key[1], key[2], key[3], key[4], key[5]);
 }
+
 static void telemetryLogAppend(const uint8_t* key, uint32_t epoch, int mv, int t10, int hum) {
   if (SD.cardType() == CARD_NONE) return;
   markSdIo();
