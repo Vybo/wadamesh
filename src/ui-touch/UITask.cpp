@@ -8975,6 +8975,74 @@ static void actionSheetLosCb(lv_event_t* e) {
 #endif  // ESP32 && MULTI_TRANSPORT_COMPANION
 
 static void actionSheetShowOnMapCb(lv_event_t* e);   // defined with the map code (uses map statics)
+static void openPathsWindow(uint32_t mesh_idx);          // Paths screen (defined below)
+static void actionSheetPathsCb(lv_event_t* e);
+
+// ===== Paths window (per-node explicit route + presets) =====================
+static lv_obj_t* s_paths_root    = nullptr;   // full-screen overlay
+static lv_obj_t* s_paths_card    = nullptr;   // scrollable content card
+static uint32_t  s_paths_idx     = 0;         // mesh idx of the contact
+static uint8_t   s_paths_pub[32] = {0};       // its pubkey (stable across edits)
+
+static void closePathsWindow() {
+  if (s_paths_root) { lv_obj_del_async(s_paths_root); s_paths_root = nullptr; s_paths_card = nullptr; }
+}
+static void pathsWindowCloseCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closePathsWindow();
+}
+
+static void openPathsWindow(uint32_t mesh_idx) {
+  ContactInfo c;
+  if (!the_mesh.getContactByIdx(mesh_idx, c)) {
+    if (g_lv.task) g_lv.task->showAlert(TR("Contact gone"), 1200);
+    return;
+  }
+  s_paths_idx = mesh_idx;
+  memcpy(s_paths_pub, c.id.pub_key, 32);
+  closePathsWindow();
+
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_paths_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_paths_root);
+  lv_obj_set_size(s_paths_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_paths_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_paths_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_paths_root, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_paths_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_move_foreground(s_paths_root);
+
+  lv_obj_t* card = lv_obj_create(s_paths_root);
+  s_paths_card = card;
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, sw - 16, sh - STATUSBAR_H - 12);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 6);
+  styleSurface(card, COLOR_PANEL, 8);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  addCloseXBadge(card, pathsWindowCloseCb);
+
+  char nm[36];
+  copyUtf8ReplacingMissingGlyphs(&g_font_14, nm, sizeof(nm), c.name);
+  lv_obj_t* title = lv_label_create(card);
+  lv_label_set_text_fmt(title, LV_SYMBOL_SHUFFLE "  Paths \xe2\x80\xa2 %s", nm[0] ? nm : "?");
+  lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+  lv_obj_set_width(title, sw - 16 - 20 - 28);
+  lv_obj_set_pos(title, 0, 0);
+}
+
+static void actionSheetPathsCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  const uint32_t idx = s_action_sheet_mesh_idx;
+  closeActionSheet();
+  openPathsWindow(idx);
+}
+
 static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const char* name, bool from_map = false) {
   s_action_sheet_mesh_idx = mesh_idx;
   s_action_sheet_is_repeater = is_repeater;
@@ -9031,12 +9099,12 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // bottom row. Grid items = msg/ping + telemetry + range + favorite + reset +
   // block (6), + trace/admin for repeaters (2), + Join for rooms (1), +
   // line-of-sight (1).
-  const int grid_items = (from_map ? 5 : 6) + (is_repeater ? 2 : 0) + (is_room ? 1 : 0) + (has_los ? 1 : 0);
+  const int grid_items = (from_map ? 5 : 6) + 1 /*Paths*/ + (is_repeater ? 2 : 0) + (is_room ? 1 : 0) + (has_los ? 1 : 0);
   const int grid_rows  = (grid_items + 1) / 2;          // ceil
   const int card_h = title_h + (grid_rows + 1) * (btn_h + btn_gap) + padding;
   lv_obj_t* card = lv_obj_create(s_action_sheet_root);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, card_w, card_h);
+  lv_obj_set_size(card, card_w, card_h > modalAvailH() ? modalAvailH() : card_h);
   lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
   lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
@@ -9044,7 +9112,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_all(card, padding, LV_PART_MAIN);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);     // long action lists scroll (Paths row added)
   addCloseXBadge(card, actionSheetCloseCb);
 
   lv_obj_t* title = lv_label_create(card);
@@ -9146,6 +9214,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   mk_btn(TOUCH_SYM_STAR "  Favorite", actionSheetFavoriteCb, 0);
 #endif
   mk_btn(LV_SYMBOL_LOOP  "  Reset path", actionSheetResetPathCb, 0);
+  mk_btn(LV_SYMBOL_SHUFFLE "  Paths", actionSheetPathsCb, 0);
   // Block / unblock — label flips on the current ignore state. Skipped when the
   // sheet is opened from a map marker (keeps that popup compact).
   if (!from_map) {
