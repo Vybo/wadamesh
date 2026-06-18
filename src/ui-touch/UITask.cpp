@@ -8976,11 +8976,13 @@ static void actionSheetLosCb(lv_event_t* e) {
 
 static void actionSheetShowOnMapCb(lv_event_t* e);   // defined with the map code (uses map statics)
 static void openPathsWindow(uint32_t mesh_idx);          // Paths screen (defined below)
+static void pathsRebuild();                              // repaint body sections
 static void actionSheetPathsCb(lv_event_t* e);
 
 // ===== Paths window (per-node explicit route + presets) =====================
 static lv_obj_t* s_paths_root    = nullptr;   // full-screen overlay
 static lv_obj_t* s_paths_card    = nullptr;   // scrollable content card
+static lv_obj_t* s_paths_body    = nullptr;   // child container holding all sections below the title
 static uint32_t  s_paths_idx     = 0;         // mesh idx of the contact
 static uint8_t   s_paths_pub[32] = {0};       // its pubkey (stable across edits)
 
@@ -8990,6 +8992,26 @@ static void closePathsWindow() {
 static void pathsWindowCloseCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   closePathsWindow();
+}
+
+// hop bytes -> uppercase hex (out must hold n*2+1)
+static void bytesToHex(const uint8_t* b, int n, char* out) {
+  for (int i = 0; i < n; ++i) sprintf(out + i * 2, "%02X", b[i]);
+  out[n * 2] = '\0';
+}
+// Find a contact whose pubkey starts with this hop (hs bytes). Best-effort
+// name resolution for display. Returns true + writes name on a match.
+static bool pathResolveHop(const uint8_t* hop, uint8_t hs, char* name, size_t cap) {
+  const int n = the_mesh.getNumContacts();
+  for (int i = 0; i < n; ++i) {
+    ContactInfo c;
+    if (!the_mesh.getContactByIdx(i, c)) continue;
+    if (memcmp(c.id.pub_key, hop, hs) == 0) {
+      copyUtf8ReplacingMissingGlyphs(&g_font_12, name, cap, c.name);
+      return true;
+    }
+  }
+  return false;
 }
 
 static void openPathsWindow(uint32_t mesh_idx) {
@@ -9034,6 +9056,93 @@ static void openPathsWindow(uint32_t mesh_idx) {
   lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
   lv_obj_set_width(title, sw - 16 - 20 - 28);
   lv_obj_set_pos(title, 0, 0);
+
+  s_paths_body = nullptr;
+  pathsRebuild();
+}
+
+static void pathsResetFloodCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  the_mesh.uiResetContactPath(s_paths_pub);
+  refreshContactsList();
+  if (g_lv.task) g_lv.task->showAlert(TR("Path reset"), 900);
+  pathsRebuild();
+}
+
+static void pathsRebuild() {
+  if (!s_paths_card) return;
+  if (s_paths_body) { lv_obj_del(s_paths_body); s_paths_body = nullptr; }
+
+  ContactInfo c;
+  if (!the_mesh.getContactByIdx(s_paths_idx, c) ||
+      memcmp(c.id.pub_key, s_paths_pub, 32) != 0) {   // idx may have shifted; re-find by pubkey
+    // best-effort re-resolve by pubkey
+    bool found = false;
+    const int n = the_mesh.getNumContacts();
+    for (int i = 0; i < n; ++i) { ContactInfo t; if (the_mesh.getContactByIdx(i, t) && memcmp(t.id.pub_key, s_paths_pub, 32) == 0) { c = t; s_paths_idx = i; found = true; break; } }
+    if (!found) { closePathsWindow(); if (g_lv.task) g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
+  }
+
+  const lv_coord_t cw = lv_obj_get_width(s_paths_card) - 20;   // minus card padding
+  s_paths_body = lv_obj_create(s_paths_card);
+  lv_obj_remove_style_all(s_paths_body);
+  lv_obj_set_size(s_paths_body, cw, LV_SIZE_CONTENT);
+  lv_obj_set_pos(s_paths_body, 0, 26);                          // under the title row
+  lv_obj_clear_flag(s_paths_body, LV_OBJ_FLAG_SCROLLABLE);
+  int y = 0;
+
+  auto section = [&](const char* t) {
+    lv_obj_t* l = lv_label_create(s_paths_body);
+    lv_label_set_text(l, TR(t));
+    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_pos(l, 0, y); y += 18;
+  };
+  auto line = [&](const char* txt, uint32_t color) {
+    lv_obj_t* l = lv_label_create(s_paths_body);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(color), LV_PART_MAIN);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(l, cw);
+    lv_obj_set_pos(l, 0, y); y += 16;
+  };
+
+  // ---- Current route ----
+  section("Current route");
+  if (c.out_path_len == OUT_PATH_UNKNOWN) {
+    line("\xe2\x97\x8f FLOOD", 0xE0E3E6);
+  } else {
+    const uint8_t hs   = (uint8_t)((c.out_path_len >> 6) + 1);
+    const uint8_t hops = (uint8_t)(c.out_path_len & 63);
+    if (hops == 0) {
+      line("\xe2\x97\x8f Zero-hop direct", 0xE0E3E6);
+    } else {
+      char hdr[40]; snprintf(hdr, sizeof hdr, "\xe2\x97\x8f DIRECT \xe2\x80\xa2 %u hops \xe2\x80\xa2 %ub", hops, hs);
+      line(hdr, 0xE0E3E6);
+      for (uint8_t i = 0; i < hops; ++i) {
+        const uint8_t* hop = &c.out_path[i * hs];
+        char hex[8]; bytesToHex(hop, hs, hex);
+        char nm[32]; char row[64];
+        if (pathResolveHop(hop, hs, nm, sizeof nm)) snprintf(row, sizeof row, "  %u. %s  (%s)", i + 1, nm, hex);
+        else                                        snprintf(row, sizeof row, "  %u. %s", i + 1, hex);
+        line(row, COLOR_TEXT);
+      }
+    }
+  }
+  y += 6;
+
+  // Reset to flood button
+  lv_obj_t* rb = lv_btn_create(s_paths_body);
+  lv_obj_set_size(rb, cw, 30);
+  lv_obj_set_pos(rb, 0, y); y += 38;
+  styleButton(rb);
+  lv_obj_add_event_cb(rb, pathsResetFloodCb, LV_EVENT_CLICKED, nullptr);
+  { lv_obj_t* l = lv_label_create(rb); lv_label_set_text(l, TR(LV_SYMBOL_LOOP "  Reset to flood"));
+    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN); lv_obj_center(l); }
+
+  // >>> Task 4 inserts the Custom-path editor here (continue running `y`) <<<
+  // >>> Task 5 inserts the Presets section here <<<
 }
 
 static void actionSheetPathsCb(lv_event_t* e) {
