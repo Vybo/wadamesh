@@ -22562,16 +22562,16 @@ static void clockMakeStepper(lv_obj_t* parent, int x, int y, int w, const char* 
   lv_obj_set_style_text_font(c, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(c, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_pos(c, x, y);
-  lv_obj_t* mn = lv_btn_create(parent); lv_obj_set_size(mn, 34, 30); lv_obj_set_pos(mn, x, y + 16); styleButton(mn);
+  lv_obj_t* mn = lv_btn_create(parent); lv_obj_set_size(mn, 30, 30); lv_obj_set_pos(mn, x, y + 16); styleButton(mn);
   lv_obj_add_event_cb(mn, clockStepCb, LV_EVENT_CLICKED, (void*)(intptr_t)(field * 2 + 0));
   lv_obj_t* ml = lv_label_create(mn); lv_label_set_text(ml, "-"); lv_obj_center(ml);
   lv_obj_t* v = lv_label_create(parent);
   lv_obj_set_style_text_font(v, &g_font_16, LV_PART_MAIN);
   lv_obj_set_style_text_color(v, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-  lv_obj_set_size(v, w - 76, 30);
+  lv_obj_set_size(v, w - 66, 30);
   lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-  lv_obj_set_pos(v, x + 38, y + 20);
-  lv_obj_t* pl = lv_btn_create(parent); lv_obj_set_size(pl, 34, 30); lv_obj_set_pos(pl, x + w - 34, y + 16); styleButton(pl);
+  lv_obj_set_pos(v, x + 33, y + 20);
+  lv_obj_t* pl = lv_btn_create(parent); lv_obj_set_size(pl, 30, 30); lv_obj_set_pos(pl, x + w - 30, y + 16); styleButton(pl);
   lv_obj_add_event_cb(pl, clockStepCb, LV_EVENT_CLICKED, (void*)(intptr_t)(field * 2 + 1));
   lv_obj_t* pll = lv_label_create(pl); lv_label_set_text(pll, "+"); lv_obj_center(pll);
   *outv = v;
@@ -22635,12 +22635,21 @@ static lv_obj_t* clockEditScaffold(int card_h, const char* title) {
   styleSurface(card, COLOR_PANEL, 8);
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  // Scrollable vertically: when the requested layout is taller than the clamped
+  // card height (e.g. the alarm editor on a 240px screen) the Save/Cancel row
+  // would otherwise be clipped off-screen and unreachable. Pad the bottom so the
+  // last control isn't flush against the edge.
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  lv_obj_set_style_pad_bottom(card, 12, LV_PART_MAIN);
   lv_obj_t* t = lv_label_create(card);
   lv_label_set_text(t, title);
   lv_obj_set_style_text_font(t, &g_font_16, LV_PART_MAIN);
   lv_obj_set_style_text_color(t, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_pos(t, 10, 8);
+  // Force a layout pass NOW so the builders below can read real lv_obj_get_width/
+  // height(card) values — a freshly-created object reports 0 until it's laid out,
+  // which was zeroing every child width (empty zone picker, broken alarm spacing).
+  lv_obj_update_layout(card);
   return card;
 }
 static void clockAddSaveCancel(lv_obj_t* card, int y) {
@@ -22690,9 +22699,11 @@ static void clockOpenAddTimer() {
   for (int i = 0; i < 4; ++i) s_edit_v[i] = nullptr;
   s_edit_ring_lbl = nullptr;
   lv_obj_t* card = clockEditScaffold(266, TR("New timer"));
+  const lv_coord_t cw = lv_obj_get_width(card);
+  const lv_coord_t colw = (cw - 30) / 2;          // two columns inside 10px margins
   s_edit_name_ta = clockMakeNameField(card, 36, TR("Name (e.g. Tea)"));
-  clockMakeStepper(card, 10,  78, 130, TR("Minutes"), CKF_A, &s_edit_v[0]);
-  clockMakeStepper(card, 150, 78, 130, TR("Seconds"), CKF_B, &s_edit_v[1]);
+  clockMakeStepper(card, 10,            78, colw, TR("Minutes"), CKF_A, &s_edit_v[0]);
+  clockMakeStepper(card, 20 + colw,     78, colw, TR("Seconds"), CKF_B, &s_edit_v[1]);
   clockMakeRingRow(card, 138);
   clockAddSaveCancel(card, 200);
   clockEditUpdateVals();
@@ -22708,8 +22719,9 @@ static void clockOpenAddAlarm() {
   s_edit_ring_lbl = nullptr;
   lv_obj_t* card = clockEditScaffold(316, TR("New alarm"));
   const lv_coord_t cw = lv_obj_get_width(card);
-  clockMakeStepper(card, 10,  36, 130, TR("Hour"),   CKF_A, &s_edit_v[0]);
-  clockMakeStepper(card, 150, 36, 130, TR("Minute"), CKF_B, &s_edit_v[1]);
+  const lv_coord_t colw = (cw - 30) / 2;          // two columns inside 10px margins
+  clockMakeStepper(card, 10,        36, colw, TR("Hour"),   CKF_A, &s_edit_v[0]);
+  clockMakeStepper(card, 20 + colw, 36, colw, TR("Minute"), CKF_B, &s_edit_v[1]);
   // weekday toggles (one-time if none selected)
   static const char* kDay = "SMTWTFS";
   const int dw = (cw - 20) / 7;
@@ -23056,6 +23068,10 @@ static void openClockApp() {
     s_clk_sw_lapbox = clockMakeScrollBox(p, 4, 100, cw - 8, ch - 104);
   }
 
+  // Lay out the freshly-built tree before the first rebuilds: they size their
+  // rows/buttons off lv_obj_get_width(box), which reports 0 until a layout pass
+  // (this was leaving the Timers tab with a zero-width — invisible — add button).
+  lv_obj_update_layout(s_clock_root);
   clockRebuildWorld();
   clockRebuildRuns();
   clockRebuildAlarms();
