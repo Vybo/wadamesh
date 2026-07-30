@@ -337,7 +337,8 @@ constexpr const char* k_ui_seg_ok      = "/msgs/store.ok";
 constexpr uint32_t    k_ui_seg_magic   = 0x55495347;   // "UISG"
 constexpr uint16_t    k_ui_seg_version = 1;
 constexpr int         k_ui_seg_records = 256;          // records per segment (~60 KB at v1 size)
-constexpr int         k_ui_seg_max     = 24;           // table cap: 5000/256 = 20 live segments + slack
+constexpr int         k_ui_seg_max     = 32;           // table cap: 5000/256 = 20 full segments, plus slack for
+                                                       // under-full ones left behind by compaction
 
 struct __attribute__((packed)) UiSegHeader {
   uint32_t magic;          // k_ui_seg_magic
@@ -4610,7 +4611,13 @@ static volatile uint32_t s_msgs_write_ok_epoch   = 0;
 static volatile uint32_t s_msgs_write_fail_epoch = 0;
 static volatile uint16_t s_msgs_write_fails   = 0;  // consecutive failures since the last success
 static volatile uint8_t  s_msgs_write_stage   = 0;  // where the last failure hit: 'o' open, 'h' header, 'b' body, 'r' rename
-static volatile int      s_msgs_write_errno   = 0;  // errno at that failure (ENFILE/EMFILE = VFS file table full, ENOSPC = card full, EIO = card error)
+static volatile int      s_msgs_write_errno   = 0;
+// Free INTERNAL heap at the moment of failure. errno 0 means the framework
+// bailed before it ever touched the card — VFSImpl::open mallocs the full path,
+// the FILE gets a ~1 KB buffer, and this build runs internal DRAM very tight
+// (Wi-Fi + tiles + LVGL). Without this number an out-of-memory write failure is
+// indistinguishable from a card fault.
+static volatile uint32_t s_msgs_write_freeint = 0;  // errno at that failure (ENFILE/EMFILE = VFS file table full, ENOSPC = card full, EIO = card error)
 // Human-readable diagnosis of the last chat-store write failure — shown on the
 // About panel and in the failure alerts, so a tester doesn't need an errno
 // table. Diagnostic vocabulary stays English on purpose (it's what ends up in
@@ -4623,7 +4630,12 @@ static void chatSaveFailText(char* out, size_t cap) {
     case 'b': stage = "write";       break;
     case 'r': stage = "rename";      break;
     case 'a': stage = "append";      break;   // segmented store: active-segment append
+    case 'A': stage = "append open"; break;
     case 'c': stage = "compact";     break;   // segmented store: one-segment rewrite
+    case 'C': stage = "compact open";break;
+    case 'H': stage = "seg header";  break;
+    case 'B': stage = "seg body";    break;
+    case 'R': stage = "seg rename";  break;
     case 'd': stage = "mkdir";       break;   // segmented store: data-dir create
     case 's': stage = "scan";        break;   // segmented store: segment discovery
     case 'm': stage = "commit";      break;   // segmented store: migration commit marker
@@ -4642,7 +4654,8 @@ static void chatSaveFailText(char* out, size_t cap) {
     case 0:      why = "no errno";            break;
     default:     why = strerror(e);           break;   // newlib carries the full table
   }
-  snprintf(out, cap, "%s failed: %s (e%d)", stage, why, e);
+  snprintf(out, cap, "%s failed: %s (e%d, %uK free)", stage, why, e,
+           (unsigned)(s_msgs_write_freeint / 1024u));
 }
 static void fmtClockHM(char* buf, size_t cap, const struct tm* t);   // fwd: 12/24h-aware HH:MM
 // "When did the chat store last save" as a CLOCK TIME rather than an age:
@@ -4740,6 +4753,7 @@ static void segMarkSeqDirty(uint32_t seq);
 static void segNoteEvicted(uint32_t seq);
 static void segRetableFromRing(const UITask::UIMessage* ring, int cap, int count, int head, uint32_t newest_seq);
 static void segPurgeStaleFiles();
+static void segReserveWriteBuf();          // fwd — reserve the writers' internal-RAM chunk buffer
 static bool uiMsgsWriteFail(char stage);   // fwd — failure stage/errno bookkeeping (writer block below)
 static int  segGatherRange(const UITask::UIMessage* ring, int cap, int count, int head,
                            uint32_t lo, uint32_t hi, UITask::UIMessage* out, int max_out);
@@ -41346,7 +41360,12 @@ void UITask::flushHistoryIfDue(unsigned long now) {
     // freezes through the FatFs volume lock). After 5 straight failures
     // retry every 5 min instead of every 30 s — the RAM ring keeps
     // everything meanwhile, and a successful write resets the counter.
-    markMsgsDirty(s_msgs_write_fails >= 5 ? 300000 : 5000);
+    // An out-of-memory write failure (the framework bails before touching the
+    // card, so there is no errno) passes on its own as soon as the heap
+    // recovers — keep retrying every 30 s instead of parking for 5 minutes the
+    // way a genuinely sick card should.
+    const bool mem_pressure = (s_msgs_write_errno == 0 || s_msgs_write_errno == ENOMEM);
+    markMsgsDirty(s_msgs_write_fails >= 5 ? (mem_pressure ? 30000 : 300000) : 5000);
     if (s_msgs_write_fails >= 3 && (s_msgs_write_fails % 3) == 0) {
       char why[64]; chatSaveFailText(why, sizeof why);
       char msg[128];
@@ -41416,6 +41435,10 @@ void UITask::flushHistoryIfDue(unsigned long now) {
       if (s_seg_stale_purge) segPurgeStaleFiles();
       _msgs_dirty = false;
       return;
+    }
+    if (armed == -2) {                    // builder asked for a table rebuild
+      _next_msgs_flush_ms = now + 500;    // s_seg_resync is handled at the top of the next pass
+      return;                             // (_msgs_dirty stays set)
     }
     if (armed < 0 || !ensureHistFlushTaskRunning()) {
       // No snapshot buffer / no worker — synchronous drain instead of losing
@@ -42145,6 +42168,7 @@ static bool uiMsgsWriteResult(bool ok) {
 static bool uiMsgsWriteFail(char stage) {
   s_msgs_write_stage = (uint8_t)stage;
   s_msgs_write_errno = errno;
+  s_msgs_write_freeint = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   return uiMsgsWriteResult(false);
 }
 
@@ -42197,15 +42221,34 @@ static void uiSegMarshal(const UITask::UIMessage& s, UiSegMsg* d) {
   d->seq = s.seq;
 }
 
-// Chunked record writer shared by append + compact: marshals through a small
-// INTERNAL-RAM buffer (the flash/SD drivers must never see a PSRAM source
-// pointer), per-record fallback when the heap is tight. Returns false on any
-// short write (errno left for the caller's stage report).
+// Chunk buffer for the record writers, reserved ONCE (early, while internal
+// RAM is still unfragmented) and never freed. It used to be a 6 KB malloc per
+// write: after hours of uptime with Wi-Fi + tiles + a big LVGL tree, internal
+// DRAM is tight enough that such a request can fail — and the failure surfaced
+// as a store write error with errno 0 (the framework bails out of open()/write()
+// before touching the card when ITS little path malloc fails, so there is no
+// errno to report). Holding one small buffer removes the per-write allocation
+// from the equation entirely.
+static uint8_t* s_seg_wbuf = nullptr;
+static size_t   s_seg_wbuf_recs = 0;
+static void segReserveWriteBuf() {
+  if (s_seg_wbuf) return;
+  const size_t REC = sizeof(UiSegMsg);
+  for (size_t recs : { (size_t)12, (size_t)8, (size_t)4 }) {   // ~2.8K / 1.9K / 0.9K
+    s_seg_wbuf = (uint8_t*)heap_caps_malloc(REC * recs, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_seg_wbuf) { s_seg_wbuf_recs = recs; return; }
+  }
+}
+
+// Chunked record writer shared by append + compact: marshals through the small
+// INTERNAL-RAM buffer above (the flash/SD drivers must never see a PSRAM source
+// pointer), per-record fallback when even that is unavailable. Returns false on
+// any short write (errno left for the caller's stage report).
 static bool uiSegWriteRecords(File& f, const UITask::UIMessage* recs, int n) {
   const size_t REC = sizeof(UiSegMsg);
-  size_t chunk_recs = 6144 / REC;
-  if (chunk_recs < 1) chunk_recs = 1;
-  uint8_t* buf = (uint8_t*)malloc(REC * chunk_recs);   // internal RAM by default
+  if (!s_seg_wbuf) segReserveWriteBuf();
+  uint8_t* buf = s_seg_wbuf;
+  const size_t chunk_recs = s_seg_wbuf_recs ? s_seg_wbuf_recs : 1;
   bool ok = true;
   if (buf) {
     size_t fill = 0;
@@ -42218,7 +42261,6 @@ static bool uiSegWriteRecords(File& f, const UITask::UIMessage* recs, int n) {
       }
     }
     if (ok && fill > 0) ok = (f.write(buf, fill) == fill);
-    free(buf);
   } else {
     UiSegMsg rec;
     for (int k = 0; ok && k < n; ++k) {
@@ -42247,11 +42289,12 @@ static bool uiSegAppendRecords(uint32_t first_seq, bool create,
   File f = uiDataOpen(name, mode);
   if (!f) {
     // First failure on a fresh card/dir is usually a missing parent dir —
-    // create it and retry once before reporting.
+    // create it and retry once before reporting. Do NOT clear errno here: an
+    // open that failed inside the framework's own allocation never sets one,
+    // and blanking it would hide whatever the first attempt did report.
     uiDataEnsureDirs();
-    errno = 0;
     f = uiDataOpen(name, mode);
-    if (!f) return uiMsgsWriteFail('a');
+    if (!f) return uiMsgsWriteFail('A');
   }
   bool ok = true;
   if (create) {
@@ -42301,21 +42344,19 @@ static bool uiSegCompactWrite(uint32_t first_seq, const UITask::UIMessage* recs,
   File f = uiDataOpen(tmp, "w");
   if (!f) {
     uiDataEnsureDirs();
-    errno = 0;
     f = uiDataOpen(tmp, "w");
-    if (!f) return uiMsgsWriteFail('c');
+    if (!f) return uiMsgsWriteFail('C');
   }
   UiSegHeader hdr{};
   hdr.magic        = k_ui_seg_magic;
   hdr.version      = k_ui_seg_version;
   hdr.msg_rec_size = (uint16_t)sizeof(UiSegMsg);
   hdr.first_seq    = first_seq;
-  bool ok = (f.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr)) == sizeof(hdr));
-  if (ok) ok = uiSegWriteRecords(f, recs, n);
+  bool hdr_ok = (f.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr)) == sizeof(hdr));
+  bool ok = hdr_ok && uiSegWriteRecords(f, recs, n);
   f.close();
-  if (!ok) { uiDataRemove(tmp); return uiMsgsWriteFail('c'); }
-  errno = 0;
-  if (!uiDataReplaceFile(fin, tmp)) return uiMsgsWriteFail('c');
+  if (!ok) { uiDataRemove(tmp); return uiMsgsWriteFail(hdr_ok ? 'B' : 'H'); }
+  if (!uiDataReplaceFile(fin, tmp)) return uiMsgsWriteFail('R');
   return uiMsgsWriteResult(true);
 }
 
@@ -42491,7 +42532,28 @@ static int segBuildJob(const UITask::UIMessage* ring, int cap, int count, int he
     out->repair    = true;             // commit also clears rewrite_open + advances the watermark
     return 1;
   }
-  // 1) Pending appends: live records newer than the durability watermark,
+  // 1) URGENT compacts, ahead of appends. A segment whose records have all
+  //    aged out of the ring compacts to nothing, i.e. the job UNLINKS it — that
+  //    is how retention actually happens, and how table slots come back. With
+  //    appends unconditionally first (they always exist on a busy channel) these
+  //    starved indefinitely: disk grew without bound and the table filled up.
+  //    Table pressure promotes ordinary dirty segments too, since compaction is
+  //    what shrinks them enough to be worth merging away.
+  const bool table_tight = (s_seg_count >= k_ui_seg_max - 4);
+  for (int i = 0; i < s_seg_count; ++i) {
+    if (!s_seg[i].compact_dirty) continue;
+    if (s_seg[i].live_recs != 0 && !table_tight) continue;
+    const int cn = segGatherRange(ring, cap, count, head,
+                                  s_seg[i].first_seq, s_seg[i].last_seq,
+                                  buf, k_ui_seg_records);
+    out->kind      = SEGJOB_COMPACT;
+    out->first_seq = s_seg[i].first_seq;
+    out->last_seq  = cn > 0 ? buf[cn - 1].seq : 0;
+    out->create    = false;
+    out->n         = cn;
+    return 1;
+  }
+  // 2) Pending appends: live records newer than the durability watermark,
   //    chronological, capped to the room left in the active segment.
   bool create = true;
   uint32_t target = 0;
@@ -42500,6 +42562,15 @@ static int segBuildJob(const UITask::UIMessage* ring, int cap, int count, int he
     create = false;
     target = s_seg[s_seg_count - 1].first_seq;
     room   = k_ui_seg_records - (int)s_seg[s_seg_count - 1].disk_recs;
+  } else if (s_seg_count >= k_ui_seg_max) {
+    // No room for the new segment this append needs. Committing it would be
+    // impossible (the table can't hold the entry), the watermark would never
+    // advance, and the identical job would repeat forever — which read as
+    // "messages just stop saving" after a long uptime. Rebuild the table from
+    // the ring instead: that collapses the under-full segments compaction left
+    // behind into ceil(live/256) chunks and re-lands them.
+    s_seg_resync = true;
+    return -2;
   }
   int n = 0;
   uint32_t last = s_seg_flushed_seq;
@@ -42523,7 +42594,7 @@ static int segBuildJob(const UITask::UIMessage* ring, int cap, int count, int he
     return 1;
   }
   if (last > s_seg_flushed_seq) s_seg_flushed_seq = last;   // pure-tombstone tail
-  // 2) Oldest compact-dirty segment: rewrite it from the ring's live records.
+  // 3) Any remaining compact-dirty segment: rewrite it from the ring's live records.
   for (int i = 0; i < s_seg_count; ++i) {
     if (!s_seg[i].compact_dirty) continue;
     const int cn = segGatherRange(ring, cap, count, head,
@@ -42747,6 +42818,12 @@ bool UITask::saveMsgsToStorage() {
     if (armed == 0) {
       if (s_seg_stale_purge) segPurgeStaleFiles();   // everything landed — drop leftovers
       return true;
+    }
+    if (armed == -2) {                         // table full — rebuild it and keep draining
+      segRetableFromRing(_ui_msgs, _ui_msg_cap, _ui_msg_count, _ui_msg_head,
+                         _ui_seq_next ? _ui_seq_next - 1 : 0);
+      s_seg_resync = false;
+      continue;
     }
     if (armed < 0) return false;               // no snapshot buffer
     bool ok;
@@ -43786,6 +43863,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
 #if defined(ESP32)
   _ui_msg_cap = uiDataFsIsSdCard() ? MAX_UI_MESSAGES_SD : MAX_UI_MESSAGES;
   uiDataEnsureDirs();   // segment dir exists before the loader scans / the first append
+  segReserveWriteBuf(); // grab the store's internal-RAM chunk buffer while the heap is still whole
 #endif
   size_t msgs_bytes          = sizeof(UIMessage) * (size_t)_ui_msg_cap;
   const size_t threads_bytes = sizeof(UIThread)  * MAX_UI_THREADS;
