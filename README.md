@@ -8,7 +8,7 @@
 <p align="center"><b>A real touchscreen UI for your mesh radio.</b> &middot; open source &middot; GPL-3.0</p>
 
 Touch-UI [MeshCore](https://github.com/meshcore-dev/MeshCore) companion-radio
-firmware for the **LilyGo T-Deck / T-Deck Plus**, **Heltec V4 + TFT** and eight other boards
+firmware for the **LilyGo T-Deck / T-Deck Plus**, **Heltec V4 + TFT** and nine other boards
 (ESP32-S3).
 
 An LVGL touch UI — map, chat, contacts, channels, settings — split out of
@@ -29,6 +29,7 @@ per-board status.
 - Heltec V4-R8 + Expansion Kit V2 — env `heltec_v4_r8_tft_companion_radio_usb_tcp_touch` (beta)
 - LilyGo T-Display P4 — built from `tdisplay_p4/` (ESP-IDF); AMOLED by default, `WADA_P4_LCD=1` for the TFT-LCD SKU (beta)
 - Attaky Mesh Series — env `attaky_mesh_series_companion_radio_touch` (beta)
+- LilyGo T-Deck Pro (e-paper) — env `LilyGo_TDeckPro_companion_radio_touch` (beta, not yet hardware-tested)
 
 ## Architecture
 

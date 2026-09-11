@@ -40,6 +40,61 @@ EnvironmentSensorManager sensors(gps);
   MomentaryButton user_btn(PIN_USER_BTN, 1000, true);
 #endif
 
+// ---------------------------------------------------------------------------
+// BQ27220 fuel gauge (I2C 0x55)
+// ---------------------------------------------------------------------------
+// The T-Deck's battery path does not exist on this board: it reads a 2:1 divider
+// on GPIO4, and GPIO4 here is BOARD_LORA_RST. So the pack is read from the gauge
+// instead, over the same I2C bus as the touch controller and the keyboard.
+//
+// Returns false when the gauge did not answer, rather than 0 -- a lost
+// transaction on a bus this contended is normal rather than exceptional, and
+// encoding it as data is what made the same gauge report a flickering 0% on the
+// T-Display P4 (#273). This mirrors variants/tdisplay_p4/target.cpp deliberately;
+// same chip, same address, same shared-bus situation.
+static bool bq27220ReadU16(uint8_t cmd, uint16_t& out) {
+  Wire.beginTransmission(0x55);
+  Wire.write(cmd);
+  if (Wire.endTransmission(false) != 0) return false;   // repeated START, no STOP
+  if (Wire.requestFrom(0x55, 2) != 2) return false;
+  const uint16_t lo = Wire.read(), hi = Wire.read();
+  out = (uint16_t)(lo | (hi << 8));
+  return true;
+}
+
+// Voltage() = REG 0x08, mV. Rate-limited to 5 s and sanity-windowed, holding the
+// last good value across a failed read so the battery UI never flickers.
+// The throttle matters: UITask smooths over 20 s, but MyMesh and the Commander
+// info panel call straight through.
+uint16_t TDeckProBoard::getBattMilliVolts() {
+  static uint32_t last_ms = 0;
+  static uint16_t last_mv = 3800;      // pre-first-read placeholder
+  const uint32_t now = millis();
+  if (last_ms == 0 || now - last_ms >= 5000) {
+    last_ms = now;
+    uint16_t mv = 0;
+    if (bq27220ReadU16(0x08, mv) && mv >= 2500 && mv <= 4600) last_mv = mv;
+    // No Serial diagnostics here on purpose -- the companion protocol owns the
+    // UART on this build. Gauge presence shows up on screen as a plausible
+    // voltage instead of the 3800 mV placeholder.
+  }
+  return last_mv;
+}
+
+// StateOfCharge() = REG 0x2C, percent. -1 means "gauge silent", which tells the
+// caller to fall back to the voltage curve instead of showing a made-up number.
+int TDeckProBoard::getBattStateOfCharge() {
+  static uint32_t last_ms = 0;
+  static int      last_pct = -1;
+  const uint32_t now = millis();
+  if (last_ms == 0 || now - last_ms >= 5000) {
+    last_ms = now;
+    uint16_t soc = 0;
+    if (bq27220ReadU16(0x2C, soc) && soc <= 100) last_pct = (int)soc;
+  }
+  return last_pct;
+}
+
 bool radio_init() {
   fallback_clock.begin();
   // Touch (0x1A), TCA8418 keyboard (0x34), BQ25896 charger (0x6B) and BQ27220

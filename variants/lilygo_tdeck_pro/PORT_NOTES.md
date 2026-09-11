@@ -42,6 +42,18 @@ failure mode is quiet** — PSRAM allocation falls back to `malloc` and starves
 DRAM — not a boot crash, so confirm it deliberately rather than assuming a
 successful boot proves it.
 
+Only the quad variant is shipped. If the board turns out to be octal, it is a
+one-line change in `boards/t-deck-pro.json`:
+
+```json
+"memory_type": "qio_opi"      // was qio_qspi
+```
+
+Symptoms that say you need it: PSRAM reported as 0 bytes in the on-screen diag
+panel, an LVGL draw-buffer or map-tile allocation failing, or the panel never
+producing an image at all (GPIO 33-37 being held by the PSRAM controller takes
+MOSI, EPD_CS, EPD_DC, SCK and EPD_BUSY with it).
+
 ## The display class
 
 `GDEQ031EpdDisplay.{h,cpp}` here, not in `src/helpers/ui/` — matching the P4,
@@ -149,46 +161,121 @@ file, not `+<helpers/ui/*.cpp>`, because the palette must be defined exactly onc
   every env is a live example — `lv_hal_indev.h` unconditionally puts it back
   to 10.)
 
-## TODO — what is scaffolded but not done
+## What is implemented
 
-1. **Wire `serviceRefresh()` into the UI loop.** Nothing calls it, so the panel
-   never updates. It belongs next to `webMirrorTick()` in `UITask::loop`, with a
-   quiescence gate so one repaint's ~14 bands become one commit.
-2. **Install the busy hook.** `GDEQ031EpdDisplay::setBusyHook()` exists and is
-   unused. Without it the loop task sleeps through the whole 0.7-1.1 s wait;
-   camillia-mt hit exactly this and lost keystrokes to a full TCA8418 FIFO. The
-   hook must pump `the_mesh.loop()` as well as the keyboard.
-3. **Make the refresh policy configurable** (the stated requirement). Append
-   trailing fields to `TouchCfg` in `TouchPrefsStore.cpp` and bump
-   `TOUCH_CFG_VER` **40 -> 41** (CLAUDE.md's "currently 5" is 35 versions stale).
-   Defaults today are hardcoded in the class: 400 ms minimum interval, full
-   refresh every 5 partials.
-4. **The keymap is wrong.** The env defines `HAS_PAGER_KEYBOARD` to reuse the
-   pager's TCA8418 driver, which also reuses the pager's 4x10 keymap. The Pro's
-   35-key layout differs, so characters will be wrong. Needs a Pro keymap table.
-5. **Battery reports 0.** `TDeckProBoard::getBattMilliVolts()` returns 0 rather
-   than reading the T-Deck's GPIO4 divider, because GPIO4 is `BOARD_LORA_RST` on
-   this board. Real reading needs the BQ27220 gauge over I2C (0x55).
-6. **CST3530 is unverified.** The protocol in `TDeckProTouch.cpp` is transcribed
-   from camillia-mt's reverse-engineering. `heltecV4CapTouchDebug()` reports
-   which controller was detected; that string reaches the on-screen diag panel,
-   which is the only diagnostic channel here (Serial belongs to the companion
-   protocol).
-7. **Palette is untouched.** The dark theme still has `COLOR_BG 0x000000`, and 8
-   of its 13 constants have luma < 128. `COLOR_SENT_BG` (32) and `COLOR_RECV_BG`
-   (28) differ by 4/255, so chat sent-vs-received will not survive 1 bpp. The
-   inversion in the display class makes the screen *legible*, not *correct*; a
-   board-gated light palette is still needed.
-8. **Nothing is registered for release.** No entry in `scripts/release.sh` ENVS,
-   `scripts/build/gen-flasher-meta.py` BOARDS, `.github/workflows/release.yml`
-   (4 sites), `deploy/site/index.html`, `deploy/flasher/index.html`, DEVICES.md
-   or README. `OTA_BIN_NAME` is already `wadamesh-tdeck-pro`, so the device will
-   look for a binary nobody publishes. This repo has shipped that exact bug twice
-   (commits 92b2ed1, cb08116).
-9. **Animations, marquees and timer cadences are untouched.** `CAP_SLOW_DISPLAY`
-   is defined and gates nothing yet. `UI_REFRESH_MS` is still 250 and
-   `updateGlobalStatusBar` still issues ~217 unconditional `lv_label_set_text`
-   calls per tick.
+All nine follow-ups from the first pass are done. None of it has run on hardware.
+
+**Panel commit.** `epdServiceTick()` (`UITask.cpp`, next to `webMirrorTick()`)
+commits a settled frame once per UI loop. Quiescence is `msSinceLastBand() >= 40 ms`
+rather than `lv_disp_flush_is_last()` — that flag means "last band of THIS
+invalidated area" and LVGL flushes several dirty rectangles per cycle, so it would
+commit a fraction of a frame and then repeat.
+
+**BUSY pump.** `epdBusyHook()` is installed once the keyboard is up. It drains the
+TCA8418 FIFO (ten events, roughly a second of typing) and yields. It deliberately
+does NOT call `the_mesh.loop()`: that has no re-entrancy guard, mutates the outbound
+queue and the packet pool, and can kick a multi-second SPIFFS rewrite. LoRa RX across
+the stall is covered by the existing core-0 drain task (`rlwRxqTask`), which already
+defaults ON for every board — turning it off in Radio & Mesh is a materially worse
+idea here than elsewhere.
+
+**Refresh policy** is four `TouchPrefsSchema::Config` trailing fields at
+**v56 -> v57** (not 40 -> 41; that figure in the first pass was wrong, and CLAUDE.md's
+"currently 5" is 51 versions stale). Settings -> Display gets minimum interval,
+de-ghost-every-N, full-on-page-change, full-on-wake and a "Refresh screen now" button.
+Dropdowns, not sliders: on this panel every drag step of a slider is its own ~0.7 s
+commit. The manual refresh is a settings row and NOT the status-bar 3 s hold — that
+gesture is already the SD screenshot, and `CAP_SD` is 1 here.
+
+**Palette.** A third `TouchPalette` (`kMonoPalette`) plus a `CAP_MONO` branch in
+`applyThemeMode()`. The premise in the first pass was wrong: it is not 13 constants,
+it is a 30-field struct plus 42 mutable `COLOR_*` globals, and `applyThemeMode` is the
+single selector. Values sit in seven luma bands ~40 apart, because 16 dither levels
+cannot carry finer distinctions; structure is carried by borders, not fills.
+`s_theme_day` is forced true, which also routes the 67 `themeRole(night, day)` sites
+onto palette roles instead of hardcoded dark literals, and picks
+`accentClampReadable`'s 105 ceiling. The ten day-literals in `applyThemeMode`'s tail
+are overridden — two of them are dark bubbles meant for a light theme and would have
+become identical ink slabs.
+
+**The inversion is gone, in all four places.** With a light palette, ink is the dark
+pixel — the identity mapping. `packBandToShadow` and the three text-path thresholds
+now agree. The palette and those four lines are a matched pair: if the UI ever renders
+the night palette here again, they must invert or the panel floods with ink.
+
+**`styleButton`** gets a `CAP_MONO` arm. Its `LV_OPA_10` fill blends to within a
+sixteenth of the background, which the Bayer matrix renders as zero ink — all 159
+buttons were invisible. On e-paper a button is a solid ink outline, and pressing it
+inverts to a solid fill.
+
+**Motion.** `UI_REFRESH_MS` 250 -> 2000; the four `LV_LABEL_LONG_SCROLL_CIRCULAR`
+marquees become `LV_LABEL_LONG_DOT` via `TOUCH_LABEL_LONG_OVERFLOW` (a marquee is
+`LV_ANIM_REPEAT_INFINITE`, i.e. a permanent refresh generator);
+`LV_THEME_DEFAULT_TRANSITION_TIME` 0; the home chart is floored at one point per 5 s;
+the 12 unconditional status-bar label writes go through `setLabelIfChanged`. Scroll
+momentum is zeroed on the REGISTERED indev — not on the pre-register struct and not
+from a theme `apply_cb`, because `lv_hal_indev.c` overwrites the former and
+`lv_obj_constructor` re-ORs `SCROLL_MOMENTUM` after `lv_theme_apply` runs.
+
+Worth knowing: none of the cadence work is what stops the screen flashing when nothing
+changed. That is the `memcmp` against the last-sent frame in `serviceRefresh()`, which
+skips the commit entirely. The cadence work stops the firmware doing the render in the
+first place.
+
+**Keymap.** `PagerKeyboardState` gains a `HAS_TDECK_PRO` arm: new tables plus new
+positions (Alt 29, R_Shift 30, L_Shift 34, Sym 31, Backspace 10, Space 32, Enter 20).
+The positions were the real hazard, not the tables — the pager's `SHIFT_POS` 28 is
+`z` on the Pro and its `SPACE_POS` 30 is R_Shift, so reusing them would silently eat
+two real keys. Sym feeds the same `LatchedModifier` as Alt. The pager values stay in
+the `#else` arm so `test/test_pager_keyboard_state.cpp` keeps passing.
+
+**Battery.** `getBattMilliVolts()` / `getBattStateOfCharge()` read the BQ27220 at
+0x55 (`Voltage()` 0x08, `StateOfCharge()` 0x2C), copied from the T-Display P4's
+driver — same chip, same address, same shared-bus situation. Reads are throttled to
+5 s, sanity-windowed and hold the last good value; a failed read returns false rather
+than 0, which is the bug that made the same gauge report a flickering 0% on the P4.
+`batteryPercentFromMv` prefers the gauge's coulomb-counted percentage over the voltage
+curve on this board.
+
+**Release registration.** `scripts/release.sh` ENVS, `scripts/build/gen-flasher-meta.py`
+BOARDS and the `deploy/site/index.html` board card — the same three files both prior
+"compiles forever, ships never" fixes touched (92b2ed1, cb08116). Plus DEVICES.md and
+README.md.
+
+Four registration surfaces were deliberately LEFT ALONE, each for a stated reason:
+- `.github/workflows/release.yml` — it only knows 2 boards and has never learned about
+  the M9, RAK, either pager, Attaky or the Wio Tracker. Adding just the Pro would make
+  it inconsistent with seven others rather than correct. `scripts/release.sh` is the
+  path that actually ships beta, and the workflow has no beta feed at all.
+- `deploy/flasher/index.html` — `deploy/README.md:77-81` states no deploy script
+  publishes it and to treat `deploy/site/index.html` as the only reachable install page.
+- `deploy/gen-meshamerica-catalog.py` — gated to stable promotes (`release.sh:141`),
+  and its `name` must match the official MeshCore device name exactly. A beta-only
+  board does not belong there yet.
+- `platformio.ini` `default_envs` — lists 3 of 10 envs; every board added since the M9
+  was left out. `scripts/build-all-targets.sh` parses the env list straight out of
+  `platformio.ini`, so the Pro is already picked up by the real build-everything path.
+
+One known collision, outside this repo tree: `.claude/skills/build-wadamesh-bin/build.sh`
+hardcodes `ENV_NAME="LilyGo_TDeck_companion_radio_touch"` and writes
+`builds/wadamesh-custom-<YYYYMMDDHHMM>.bin` with no board token, so a T-Deck and a
+T-Deck Pro build in the same minute overwrite each other. It lives in the main
+checkout's `.claude/`, not here.
+
+## Still unverified
+
+- **Every pin, and the whole keymap.** Two independent upstream sources agree, but
+  neither was run on this unit.
+- **CST3530.** The protocol is transcribed from camillia-mt's reverse-engineering.
+  `heltecV4CapTouchDebug()` reports which controller was detected; it reaches the
+  on-screen diag panel, which is the only diagnostic channel here.
+- **PSRAM mode** — the go/no-go above.
+- **Whether a region-limited refresh is faster than a full-screen one** on UC8253.
+  Nothing here depends on it (the driver always pushes the whole frame, as camillia-mt
+  does), but if it IS faster there is a real win left on the table.
+- **Keyboard vs touch I2C contention.** `CAP_TOUCH` is 1, so the core-0 touch task
+  polls the same Wire bus at 125 Hz that the keyboard is drained from on the UI loop.
+  The pager never had this problem because it has no touchscreen.
 
 ## First hardware steps
 

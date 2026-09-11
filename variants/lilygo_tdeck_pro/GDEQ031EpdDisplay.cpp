@@ -82,7 +82,7 @@ GDEQ031EpdDisplay::GDEQ031EpdDisplay()
     _mono(nullptr), _sent(nullptr), _have_sent(false), _lvgl_active(false),
     _is_on(false), _dirty(false), _force_full(true), _partial_count(0),
     _brightness_pct(0), _min_interval_ms(400), _full_every_n(5),
-    _last_commit_at(0), _last_refresh_ms(0), _last_was_full(false),
+    _last_commit_at(0), _last_refresh_ms(0), _last_band_at(0), _last_was_full(false),
     _text_color(0xFFFF)
 { }
 
@@ -142,6 +142,11 @@ bool GDEQ031EpdDisplay::begin() {
   return true;
 }
 
+uint32_t GDEQ031EpdDisplay::msSinceLastBand() const {
+  if (_last_band_at == 0) return UINT32_MAX;
+  return (uint32_t)(millis() - _last_band_at);
+}
+
 void GDEQ031EpdDisplay::fillShadow(bool white) {
   if (_mono) memset(_mono, white ? 0xFF : 0x00, kMonoBytes);
 }
@@ -161,9 +166,14 @@ void GDEQ031EpdDisplay::packBandToShadow(int x, int y, int w, int h, const uint1
     for (int col = 0; col < w; ++col) {
       const int px = x + col;
       if (px < 0 || px >= PANEL_WIDTH) continue;
-      // Bright UI pixel -> black ink. See the header: the UI is a dark theme,
-      // so the mapping is deliberately not the identity.
-      const bool ink = lumaFromRgb565(src[col]) > bayer_row[px & 3];
+      // DARK UI pixel -> black ink. This is the identity mapping, and it is
+      // only correct because the UI runs kMonoPalette (a LIGHT theme) on this
+      // board -- see applyThemeMode() in UITask.cpp, gated on CAP_MONO.
+      //
+      // The palette and this line are a matched pair. If the UI ever renders
+      // the dark night palette here again, this must invert or the panel floods
+      // with ink: a 0x000000 background would become solid black.
+      const bool ink = lumaFromRgb565(src[col]) <= bayer_row[px & 3];
       uint8_t& byte = dst_row[px >> 3];
       const uint8_t bit = (uint8_t)(0x80u >> (px & 7));
       if (ink) byte &= (uint8_t)~bit;   // clear = ink
@@ -177,6 +187,7 @@ void GDEQ031EpdDisplay::writePixelsRGB565(int x, int y, int w, int h, const uint
   packBandToShadow(x, y, w, h, pixels);
   _lvgl_active = true;
   _dirty = true;
+  _last_band_at = millis();
   // Deliberately no refresh here. lvglFlush is per-band; committing here would
   // mean ~14 panel updates per full repaint. UITask's loop calls
   // serviceRefresh() once the bands have stopped arriving.
@@ -207,19 +218,20 @@ void GDEQ031EpdDisplay::print(const char* str)  { if (_impl && str) _impl->epd.p
 void GDEQ031EpdDisplay::setColor(ColorVal c) {
   _text_color = (uint16_t)c;
   if (!_impl) return;
-  // One bit of ink. Anything that is not near-black in the source palette is
-  // ink on paper, matching the bright-pixel-is-ink rule the LVGL path uses.
-  _impl->epd.setTextColor(lumaFromRgb565(_text_color) > 24 ? GxEPD_BLACK : GxEPD_WHITE);
+  // One bit of ink, thresholded at mid-luma to match the LVGL path's
+  // dark-pixel-is-ink rule (both paths must agree, or the boot splash renders
+  // inverted relative to the UI that replaces it).
+  _impl->epd.setTextColor(lumaFromRgb565(_text_color) < 128 ? GxEPD_BLACK : GxEPD_WHITE);
 }
 
 void GDEQ031EpdDisplay::fillRect(int x, int y, int w, int h) {
   if (!_impl) return;
-  _impl->epd.fillRect(x, y, w, h, lumaFromRgb565(_text_color) > 24 ? GxEPD_BLACK : GxEPD_WHITE);
+  _impl->epd.fillRect(x, y, w, h, lumaFromRgb565(_text_color) < 128 ? GxEPD_BLACK : GxEPD_WHITE);
 }
 
 void GDEQ031EpdDisplay::drawRect(int x, int y, int w, int h) {
   if (!_impl) return;
-  _impl->epd.drawRect(x, y, w, h, lumaFromRgb565(_text_color) > 24 ? GxEPD_BLACK : GxEPD_WHITE);
+  _impl->epd.drawRect(x, y, w, h, lumaFromRgb565(_text_color) < 128 ? GxEPD_BLACK : GxEPD_WHITE);
 }
 
 void GDEQ031EpdDisplay::drawXbm(int x, int y, const uint8_t* bits, int w, int h) {

@@ -216,6 +216,30 @@ bool    touchPrefsGetBootWifiTime();
 bool    touchPrefsSetBootWifiTime(bool on);
 bool    touchPrefsGetLoudAlerts();
 bool    touchPrefsSetLoudAlerts(bool on);
+
+/**
+ * E-paper refresh policy (v57). Read only by CAP_EINK builds (T-Deck Pro); the
+ * fields exist on every board so the persisted blob layout stays
+ * board-independent.
+ *
+ * A bistable panel makes refreshing a user-visible cost rather than a free
+ * side effect: each commit takes 0.7-1.1 s and flashes, and partial updates
+ * accumulate ghosting that only a full de-ghost cycle clears. Someone reading
+ * static text wants the calmest possible screen; someone watching a chart
+ * wants freshness. Hence a preference, not a constant.
+ *
+ * MinRefreshMs is the floor between commits, clamped to [200, 30000].
+ * FullEveryN forces a de-ghost after N partial updates; 0 legitimately means
+ * "never automatically" and is NOT clamped up.
+ */
+uint16_t touchPrefsGetEpdMinRefreshMs();
+bool     touchPrefsSetEpdMinRefreshMs(uint16_t ms);
+uint8_t  touchPrefsGetEpdFullEveryN();
+bool     touchPrefsSetEpdFullEveryN(uint8_t n);
+bool     touchPrefsGetEpdFullOnScreen();
+bool     touchPrefsSetEpdFullOnScreen(bool on);
+bool     touchPrefsGetEpdFullOnWake();
+bool     touchPrefsSetEpdFullOnWake(bool on);
 bool    touchPrefsGetBootWifiTimeOpen();
 bool    touchPrefsSetBootWifiTimeOpen(bool on);
 bool    touchPrefsGetBootAdvert();

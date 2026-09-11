@@ -58,6 +58,13 @@
 // also runs the_mesh.loop() is wasted time the mesh wants back.
 #if defined(HAS_TDECK_PRO)
 #define LV_DISP_DEF_REFR_PERIOD 500
+// The stock theme animates bg-colour/opacity over 80 ms on press and release of
+// every button. On a bistable panel that is two extra panel updates per tap,
+// showing a colour fade that 1 bpp cannot represent anyway. Zero it.
+// (This one WOULD accept a per-env -D, because it is absent from this file and
+// #ifndef-guarded in lv_conf_internal.h — but it is kept here beside the other
+// e-paper cadence settings so the whole policy is readable in one place.)
+#define LV_THEME_DEFAULT_TRANSITION_TIME 0
 #else
 #define LV_DISP_DEF_REFR_PERIOD 16
 #endif

@@ -143,6 +143,14 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.boot_wifi_open    = 0;      // OFF: and never a saved OPEN network even then
   c.loud_alerts       = 0;      // OFF: the standard chime pitch unless asked for
   c.theme_mode        = 0;      // Night: preserves the existing firmware appearance
+  // v57 e-paper refresh policy. Inert on every board except the T-Deck Pro.
+  // 400 ms / every 5 partials mirrors the display class's built-in defaults and
+  // Good Display's own advice for this panel (a full de-ghost roughly every
+  // five partial updates).
+  c.epd_min_refresh_ms = 400;
+  c.epd_full_every_n   = 5;
+  c.epd_full_on_screen = 1;     // a tab/page switch changes everything; partial-update it and it smears
+  c.epd_full_on_wake   = 1;     // clear whatever ghosting accrued while the panel sat idle
   c.compact_chat      = 0;      // OFF: bubble chat layout (opt-in IRC-style dense rows)
   c.clock_floor       = 0;      // no persisted send-timestamp floor yet
   c.rx_queue          = 1;      // ON: buffered receive (test-channel default; opt-out toggle in Radio & Mesh)
@@ -257,6 +265,16 @@ static void cfgLoadOrMigrate() {
         if (stored_version < 54) { s_cfg.boot_wifi_time = 0; s_cfg.boot_wifi_open = 0; }
         if (stored_version < 55) { s_cfg.loud_alerts = 0; }
         if (stored_version < 56) { s_cfg.theme_mode = 0; }   // Night: unchanged appearance
+        // v57: four new trailing fields. Force them to the SAME values
+        // cfgSetDefaults uses -- an inherited garbage byte here would be a
+        // nonsense refresh policy (0 ms interval = refresh every frame) on a
+        // panel that physically cannot sustain it.
+        if (stored_version < 57) {
+          s_cfg.epd_min_refresh_ms = 400;
+          s_cfg.epd_full_every_n   = 5;
+          s_cfg.epd_full_on_screen = 1;
+          s_cfg.epd_full_on_wake   = 1;
+        }
         if (stored_version < 31) s_cfg.compact_chat = 0;  // new trailing field: compact chat rows off by default
         if (stored_version < 32) s_cfg.clock_floor = 0;   // new trailing field: no send-timestamp floor persisted yet (#89)
         if (stored_version < 33) s_cfg.rx_queue = 1;      // buffered LoRa receive ON for the test channel (opt-out toggle in Radio & Mesh)
@@ -1169,6 +1187,64 @@ bool touchPrefsGetBootWifiTimeOpen() {
 bool touchPrefsSetBootWifiTimeOpen(bool on) {
   if (!s_begun) touchPrefsBegin();
   s_cfg.boot_wifi_open = on ? 1 : 0;
+  return cfgFlush();
+}
+
+// ---- v57 e-paper refresh policy ----------------------------------------
+// Bounds are clamped on both read and write: a corrupt stored byte must not be
+// able to ask a bistable panel for a refresh rate it cannot physically sustain.
+static const uint16_t EPD_MIN_REFRESH_MS_MIN = 200;    // below the panel's own partial-update time
+static const uint16_t EPD_MIN_REFRESH_MS_MAX = 30000;  // 30 s -- effectively "only on demand"
+static const uint8_t  EPD_FULL_EVERY_MAX     = 60;
+
+uint16_t touchPrefsGetEpdMinRefreshMs() {
+  if (!s_begun) touchPrefsBegin();
+  uint16_t ms = s_cfg.epd_min_refresh_ms;
+  if (ms < EPD_MIN_REFRESH_MS_MIN) ms = EPD_MIN_REFRESH_MS_MIN;
+  if (ms > EPD_MIN_REFRESH_MS_MAX) ms = EPD_MIN_REFRESH_MS_MAX;
+  return ms;
+}
+bool touchPrefsSetEpdMinRefreshMs(uint16_t ms) {
+  if (ms < EPD_MIN_REFRESH_MS_MIN) ms = EPD_MIN_REFRESH_MS_MIN;
+  if (ms > EPD_MIN_REFRESH_MS_MAX) ms = EPD_MIN_REFRESH_MS_MAX;
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_min_refresh_ms = ms;
+  return cfgFlush();
+}
+
+// 0 is a LEGITIMATE stored value -- it means "never de-ghost automatically",
+// which is what someone leaving the device on a static screen wants. Only the
+// upper bound is clamped.
+uint8_t touchPrefsGetEpdFullEveryN() {
+  if (!s_begun) touchPrefsBegin();
+  uint8_t n = s_cfg.epd_full_every_n;
+  if (n > EPD_FULL_EVERY_MAX) n = EPD_FULL_EVERY_MAX;
+  return n;
+}
+bool touchPrefsSetEpdFullEveryN(uint8_t n) {
+  if (n > EPD_FULL_EVERY_MAX) n = EPD_FULL_EVERY_MAX;
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_full_every_n = n;
+  return cfgFlush();
+}
+
+bool touchPrefsGetEpdFullOnScreen() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.epd_full_on_screen != 0;
+}
+bool touchPrefsSetEpdFullOnScreen(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_full_on_screen = on ? 1 : 0;
+  return cfgFlush();
+}
+
+bool touchPrefsGetEpdFullOnWake() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.epd_full_on_wake != 0;
+}
+bool touchPrefsSetEpdFullOnWake(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_full_on_wake = on ? 1 : 0;
   return cfgFlush();
 }
 

@@ -128,6 +128,21 @@ public:
    *  `force` bypasses the minimum-interval throttle (not the no-change skip). */
   bool serviceRefresh(bool force = false);
 
+  /** Milliseconds since the last band arrived through writePixelsRGB565(), or
+   *  UINT32_MAX if none ever has.
+   *
+   *  This is the quiescence signal. One LVGL repaint arrives as ~14 separate
+   *  flush callbacks; committing after the first would show a fourteenth of a
+   *  frame and then repeat. The loop-side tick waits for a short gap with no
+   *  new bands before deciding the frame is whole. A timestamp is used rather
+   *  than lv_disp_flush_is_last(), because "last band of THIS invalidated
+   *  region" is not the same as "last region of this frame" — several
+   *  independent dirty rectangles are flushed per refresh cycle. */
+  uint32_t msSinceLastBand() const;
+
+  /** True if a commit is pending (dirty and not yet pushed). */
+  bool refreshPending() const { return _dirty; }
+
   /** Refresh policy, driven from prefs (see touchPrefsGetEpd* in
    *  TouchPrefsStore). full_every_n == 0 disables automatic full refreshes. */
   void setRefreshPolicy(uint16_t min_interval_ms, uint8_t full_every_n);
@@ -160,6 +175,7 @@ private:
   uint8_t    _full_every_n;
   uint32_t   _last_commit_at;
   uint32_t   _last_refresh_ms;
+  uint32_t   _last_band_at;   // millis() of the most recent writePixelsRGB565 band
   bool       _last_was_full;
   uint16_t   _text_color;  // RGB565 as handed to setColor(); only luma is used
 };

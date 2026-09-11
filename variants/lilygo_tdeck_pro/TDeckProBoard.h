@@ -40,10 +40,17 @@ public:
     esp_deep_sleep_start();
   }
 
-  // 0 == "unknown" to the UI. See the class comment: there is no ADC path on
-  // this board, and inventing one from the wrong GPIO would be worse.
-  // TODO(t-deck-pro): BQ27220 over I2C (0x55).
-  uint16_t getBattMilliVolts() { return 0; }
+  // Both come from the BQ27220 fuel gauge on the shared I2C bus (0x55), NOT from
+  // an ADC divider -- see the class comment. Defined in target.cpp because they
+  // need Wire, which this header deliberately does not drag into every TU that
+  // includes target.h.
+  uint16_t getBattMilliVolts();
+
+  // Coulomb-counted percentage from the gauge, or -1 when it does not answer.
+  // Preferred over the generic voltage curve: terminal voltage is charger-driven,
+  // so on USB it pins to 100% while the pack is flat (the #273 failure on the
+  // T-Display P4, which carries the same gauge).
+  int getBattStateOfCharge();
 
   const char* getManufacturerName() const { return "LilyGo T-Deck Pro"; }
 };

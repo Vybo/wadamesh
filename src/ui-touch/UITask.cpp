@@ -247,7 +247,28 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
   #endif
 #endif
 
+#if CAP_SLOW_DISPLAY
+// A bistable panel cannot show 4 updates a second, so producing them only burns
+// CPU and battery. 2 s is still well inside the refresh policy's own floor, so
+// the panel cadence is set by the policy rather than by this tick.
+//
+// Note this is NOT what stops the screen flashing when nothing changed -- that
+// is the byte-diff in GDEQ031EpdDisplay::serviceRefresh(), which skips the
+// commit entirely when the packed frame is identical. This just stops the
+// firmware doing the work in the first place.
+constexpr unsigned long UI_REFRESH_MS = 2000;
+#else
 constexpr unsigned long UI_REFRESH_MS = 250;
+#endif
+// Overflowing-label behaviour. A marquee is lv_anim with REPEAT_INFINITE: on a
+// panel that takes ~0.7 s per update it is not a nicety, it is a permanent
+// refresh generator that never lets the screen settle. Ellipsis instead.
+#if CAP_SLOW_DISPLAY
+  #define TOUCH_LABEL_LONG_OVERFLOW LV_LABEL_LONG_DOT
+#else
+  #define TOUCH_LABEL_LONG_OVERFLOW LV_LABEL_LONG_SCROLL_CIRCULAR
+#endif
+
 constexpr int UI_SORT_SCRATCH = UITask::MAX_UI_THREADS;
 UIEventType g_last_event = UIEventType::none;
 
@@ -542,6 +563,39 @@ static constexpr TouchPalette kDayPalette = {
   0xFFFFFF, 0xD8E0E6, 0xD5DDE3, 0xF8FAFB,
 };
 
+#if CAP_MONO
+// ---- colour palette: E-PAPER (1 bpp) ----
+// A third palette, not a tweak of the other two. On a bistable 1-bpp panel a
+// colour is not a colour: the driver reduces it to Rec.601 luma and an ordered
+// 4x4 Bayer matrix turns that into one of 16 ink levels. Two roles that differ
+// in hue but not in luma become the SAME pixels. The night palette fails that
+// test badly -- sent_bg (luma 32) vs recv_bg (28) is a 4/255 gap, so sent and
+// received chat bubbles are indistinguishable -- and the day palette fails it
+// the same way (229 vs 233).
+//
+// So the rule here is luma spacing, not aesthetics: every value sits in one of
+// seven bands roughly 40 apart (255 / 208 / 184 / 136 / 80 / 56 / 0), which is
+// the finest distinction 16 dither levels can carry at this pixel pitch.
+// Greys are neutral (R=G=B) on purpose -- for a grey, Rec.601 luma IS the byte
+// value, so what is written here is exactly what the panel renders.
+//
+// Structure is carried by BORDERS rather than fills: border is solid ink, and
+// panel is the same paper white as bg. On paper an outline reads instantly
+// where a 5%-lighter fill does not.
+static constexpr TouchPalette kMonoPalette = {
+  0xFFFFFF, 0xFFFFFF, 0x000000, 0x505050,   // bg, panel (outlined, not filled), text, sub
+  0xD8D8D8, 0xFFFFFF,                       // sent_bg 216 vs recv_bg 255 -- a real gap this time
+  0x000000, 0xB8B8B8,                       // mention, mention_bg
+  0xD0D0D0, 0xA0A0A0, 0x888888, 0x383838, 0x181818,   // ok, ok_pressed, warn, danger, danger_pressed
+  0x000000, 0x000000, 0x000000,             // status *_text: ink on paper, hue carried nothing here
+  0xB8B8B8,                                 // status_info
+  0x000000, 0xFFFFFF, 0xE8E8E8, 0xC0C0C0, 0x888888,   // border (ink), field, control, disabled, pressed
+  0xD0D0D0, 0x000000,                       // accent_surface, accent_border (ink)
+  0xB8B8B8, 0x383838,                       // chart_grid, chart_tick
+  0xFFFFFF, 0xC8C8C8, 0xD0D0D0, 0xFFFFFF,   // raised, secondary_action, track, chart_bg
+};
+#endif
+
 static bool s_theme_day = false;
 static uint32_t COLOR_BG            = kNightPalette.bg;
 static uint32_t COLOR_PANEL         = kNightPalette.panel;
@@ -617,8 +671,21 @@ static uint32_t COLOR_TRACK            = kNightPalette.track;
 static uint32_t COLOR_CHART_BG         = kNightPalette.chart_bg;
 
 static void applyThemeMode(uint8_t mode) {
+#if CAP_MONO
+  // The Day/Night pref is ignored on e-paper -- there is one palette that works
+  // at 1 bpp and it is neither of them. s_theme_day is still set true, and that
+  // is load-bearing beyond the palette: the 67 themeRole(night, day) sites pick
+  // their day argument (which is always a COLOR_* role, so they route through
+  // this palette instead of a hardcoded dark literal), and accentClampReadable
+  // switches to its 105 luma ceiling so a picked accent stays dark enough for
+  // light text to sit on it.
+  (void)mode;
+  s_theme_day = true;
+  const TouchPalette& p = kMonoPalette;
+#else
   s_theme_day = mode == TOUCH_THEME_DAY;
   const TouchPalette& p = s_theme_day ? kDayPalette : kNightPalette;
+#endif
   COLOR_BG = p.bg;
   COLOR_PANEL = p.panel;
   COLOR_TEXT = p.text;
@@ -649,6 +716,23 @@ static void applyThemeMode(uint8_t mode) {
   COLOR_SECONDARY_ACTION = p.secondary_action;
   COLOR_TRACK = p.track;
   COLOR_CHART_BG = p.chart_bg;
+#if CAP_MONO
+  // These ten would otherwise take the DAY literals (s_theme_day is forced true
+  // above), and several of them are dark bubbles designed for a light theme
+  // with white text -- 0x28556B and 0x3C4852 are luma 74 and 69, which at 1 bpp
+  // are two near-identical solid-ink slabs with black text on them. Chat would
+  // be unreadable. Set them from the mono palette instead.
+  COLOR_ON_ACCENT        = 0xFFFFFFu;   // the accent is clamped dark (<=105), so light text on it
+  COLOR_ON_STATUS_OK     = 0x000000u;   // ...on a luma-208 fill
+  COLOR_ON_STATUS_DANGER = 0xFFFFFFu;   // ...on a luma-56 fill
+  COLOR_ON_STATUS_INFO   = 0x000000u;   // ...on a luma-184 fill
+  COLOR_CHAT_TEXT        = p.text;
+  COLOR_CHAT_META        = p.sub;
+  COLOR_CHAT_LINK        = p.text;      // links are underlined, not tinted -- hue carries nothing here
+  COLOR_CHAT_SENT_BG     = p.sent_bg;
+  COLOR_CHAT_RECV_BG     = p.recv_bg;
+  COLOR_CHAT_MENTION_BG  = p.mention_bg;
+#else
   COLOR_ON_ACCENT = s_theme_day ? 0xFFFFFFu : p.text;
   COLOR_ON_STATUS_OK = s_theme_day ? 0x15351Du : p.text;
   COLOR_ON_STATUS_DANGER = s_theme_day ? 0x571515u : p.text;
@@ -659,6 +743,7 @@ static void applyThemeMode(uint8_t mode) {
   COLOR_CHAT_SENT_BG = s_theme_day ? 0x28556Bu : p.sent_bg;
   COLOR_CHAT_RECV_BG = s_theme_day ? 0x3C4852u : p.recv_bg;
   COLOR_CHAT_MENTION_BG = s_theme_day ? 0x1D5F8Au : p.mention_bg;
+#endif
 }
 
 static inline uint32_t themeRole(uint32_t night, uint32_t day) {
@@ -1667,6 +1752,7 @@ struct GlobalStatusBar {
 };
 static GlobalStatusBar g_statusbar = {};
 static void updateGlobalStatusBar();   // fwd decl, called from refresh tick
+static inline void setLabelIfChanged(lv_obj_t* lbl, const char* txt);  // fwd decl (defined below updateGlobalStatusBar)
 
 // Settings detail pages render the global status bar at DOUBLE height: the bar's
 // back chevron + page title then read like a tall title bar (the whole bar still
@@ -3113,6 +3199,27 @@ static void styleButton(lv_obj_t* obj) {
   // Press state flashes a brighter slate fill so taps still register.
   // Primary action buttons (Send / Save / Login / Apply / Add) override
   // the bg to COLOR_STATUS_OK so they remain visually distinct.
+#if CAP_MONO
+  // The chip's whole visual language upstream is ALPHA: a 10%-opacity accent
+  // fill over the background, with a 40%-opacity border. At 1 bpp that is not
+  // subtle, it is invisible -- LV_OPA_10 of any colour over any background
+  // blends to within a sixteenth of that background, which the 4x4 Bayer
+  // matrix renders as zero ink. All 159 buttons would be indistinguishable
+  // from the page, and the border would come out as a broken dotted line.
+  //
+  // So on e-paper a button is defined by a solid 1-px ink outline on paper,
+  // and pressing it inverts to a solid ink fill. Both states are unambiguous
+  // at one bit, and the press state is a real state change rather than a
+  // brightness nudge -- which matters when the panel takes ~0.7 s to show it.
+  lv_obj_set_style_bg_color(obj, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(obj, lv_color_hex(COLOR_TEXT), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_text_color(obj, lv_color_hex(COLOR_BG), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(obj, lv_color_hex(COLOR_BORDER), LV_PART_MAIN);
+  lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN);
+  lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+#else
   lv_obj_set_style_bg_color(obj, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(obj, LV_OPA_10, LV_PART_MAIN);
   lv_obj_set_style_bg_color(obj, lv_color_hex(COLOR_ACCENT_PRESS), LV_PART_MAIN | LV_STATE_PRESSED);
@@ -3120,6 +3227,7 @@ static void styleButton(lv_obj_t* obj) {
   lv_obj_set_style_border_color(obj, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
   lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN);
   lv_obj_set_style_border_opa(obj, LV_OPA_40, LV_PART_MAIN);
+#endif
   lv_obj_set_style_text_color(obj, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   // ...and the font, for the same reason as the text colour. A button carries a
   // font from the LVGL theme which its child label inherits, and that one has no
@@ -3481,6 +3589,63 @@ static void webMirrorQueueRegion(int rx, int ry, int rw, int rh) {
 // Called each UI loop AFTER lv_timer_handler (so this frame's flushes are already in
 // the shadow). Only sends once the previous frame fully drained, so it self-paces to
 // the link speed (never backs up -> no disconnects) while staying crisp.
+#if CAP_EINK
+// ---------------------------------------------------------------------------
+// E-paper commit tick + BUSY hook
+// ---------------------------------------------------------------------------
+// The panel is NEVER updated from lvglFlush. One LVGL repaint arrives as ~14
+// separate flush callbacks (240 x LV_DRAW_BUF_LINES), and a single update costs
+// 0.7-1.1 s blocking on the controller's BUSY line -- so committing per band
+// would be ~14 panel updates and ~15 s per screen. writePixelsRGB565() only
+// composites into the 1-bpp shadow; this tick does the commit, exactly the same
+// accumulate-then-commit split webMirrorTick() uses for the browser mirror.
+//
+// QUIESCENCE: wait for a short gap with no new bands rather than for
+// lv_disp_flush_is_last(). That flag means "last band of THIS invalidated
+// area", and LVGL flushes several independent dirty rectangles per refresh
+// cycle -- committing on it would show a fraction of a frame and then repeat.
+// With LV_DISP_DEF_REFR_PERIOD at 500 ms on this board, a 40 ms silence is
+// unambiguous.
+static const uint32_t EPD_QUIESCE_MS = 40;
+
+static void epdServiceTick() {
+  if (!display.refreshPending()) return;
+  if (display.msSinceLastBand() < EPD_QUIESCE_MS) return;   // frame still arriving
+  display.serviceRefresh();                                 // honours the min-interval + full-every-N policy
+}
+
+// Installed as GxEPD2's busy callback, so the 0.7-1.1 s BUSY wait does something
+// useful instead of sleeping through it in delay(1).
+//
+// WHAT THIS DELIBERATELY DOES NOT DO: call the_mesh.loop(). main.cpp's loop()
+// runs ui_task.loop() and the_mesh.loop() sequentially, so there is no outer
+// mesh loop on the stack and it *looks* safe -- but MyMesh::loop() and the
+// core's Dispatcher::loop() have no re-entrancy guard, mutate the outbound
+// queue and the packet pool, and can kick a multi-second SPIFFS contacts
+// rewrite. Re-entering that from inside a panel refresh trades dropped packets
+// for corrupted ones.
+//
+// The supported mitigation for LoRa RX across a long stall is the buffered
+// receive drain (rlwRxqTask, core 0), which is already ON by default for every
+// board (c.rx_queue in cfgSetDefaults) -- it matters far more here than
+// elsewhere, because the SX1262 buffers exactly ONE packet behind a single DIO1
+// flag, so an un-drained second-long refresh loses all but the last arrival.
+// It is user-disablable in Radio & Mesh; turning it off on this board is a
+// materially worse idea than on the others. What the hook DOES pump is
+// the keyboard: the TCA8418 has a ten-event FIFO and silently drops keystrokes
+// once it fills, which is roughly what a second of typing costs.
+static void epdBusyHook() {
+  static bool in_hook = false;
+  if (in_hook) { delay(1); return; }     // never recurse into the pump
+  in_hook = true;
+#if defined(HAS_PAGER_KEYBOARD)
+  pagerKeyboardPoll();                   // drain the TCA8418 FIFO so keys are not lost
+#endif
+  in_hook = false;
+  delay(1);                              // yield to core 0 (rlwRxqTask, touch poll)
+}
+#endif  // CAP_EINK
+
 static void webMirrorTick() {
   if (!g_web_mirror.active() || !s_web_dirty || !s_web_fb) return;
   if (!g_web_mirror.empty()) return;             // previous frame still draining -> adapt to link speed
@@ -8731,6 +8896,13 @@ static void updateTabIndicator() {
 static void tabChangedCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   scheduleHeavyRefresh(170);
+#if CAP_EINK
+  // A tab switch changes essentially every pixel. Pushing that as a partial
+  // update is the worst case for a bistable panel -- the old page stays faintly
+  // visible underneath -- so de-ghost instead, if the user wants it. The commit
+  // itself still goes through the normal quiescence + throttle path.
+  if (touchPrefsGetEpdFullOnScreen()) display.requestRefresh(true);
+#endif
   closeSettingsModal();
   closeSettingsCategory();   // a category detail sheet floats on layer_top — drop it on tab change
   closeMentionsScreen();     // transient overlay — switching tabs leaves it
@@ -12340,6 +12512,52 @@ static void msgFlashToggleCb(lv_event_t* e) {
 
 // 12-hour vs 24-hour clock. Applies on the next time render (status bar, chat
 // rows, message bubbles).
+#if CAP_EINK
+// ---- E-paper refresh policy (Settings -> Display) --------------------------
+// Dropdowns rather than sliders on purpose: on a bistable panel every drag step
+// of a slider is its own ~0.7 s panel commit, so a slider is actively unpleasant
+// to operate. A short list of discrete values is one commit per choice.
+static const uint16_t k_epd_interval_opts[] = { 200, 400, 800, 1500, 3000, 5000, 10000 };
+static const uint8_t  k_epd_full_every_opts[] = { 0, 3, 5, 10, 20, 40 };
+
+static void epdMinRefreshSelectCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const uint16_t i = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (i >= (sizeof(k_epd_interval_opts) / sizeof(k_epd_interval_opts[0]))) return;
+  touchPrefsSetEpdMinRefreshMs(k_epd_interval_opts[i]);
+  display.setRefreshPolicy(touchPrefsGetEpdMinRefreshMs(), touchPrefsGetEpdFullEveryN());
+  if (g_lv.task) g_lv.task->showAlert(TR("Refresh interval saved"), 900);
+}
+
+static void epdFullEverySelectCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const uint16_t i = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (i >= (sizeof(k_epd_full_every_opts) / sizeof(k_epd_full_every_opts[0]))) return;
+  touchPrefsSetEpdFullEveryN(k_epd_full_every_opts[i]);
+  display.setRefreshPolicy(touchPrefsGetEpdMinRefreshMs(), touchPrefsGetEpdFullEveryN());
+  if (g_lv.task) g_lv.task->showAlert(TR("De-ghost interval saved"), 900);
+}
+
+static void epdFullOnScreenToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  touchPrefsSetEpdFullOnScreen(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+static void epdFullOnWakeToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  touchPrefsSetEpdFullOnWake(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+// Manual de-ghost. NOT on the status-bar 3 s hold: that gesture is already the
+// SD screenshot (statusBarHoldCb), and CAP_SD is 1 on this board.
+static void epdRefreshNowCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  display.requestRefresh(true);            // force a full flash-to-black cycle
+  display.serviceRefresh(true);            // ...and bypass the min-interval throttle
+  if (g_lv.task) g_lv.task->showAlert(TR("Screen refreshed"), 900);
+}
+#endif  // CAP_EINK
+
 static void clock12hToggleCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
@@ -13508,6 +13726,77 @@ static void buildDeviceSettings(int sec) {
   }
 
   if (sec == DSEC_DISPLAY) {   // --- Display ---
+#if CAP_EINK
+    /* E-paper: how often the panel is allowed to change, and when it may flash.
+       Both are genuine trade-offs rather than tuning knobs -- see the header
+       comment on the epd_* fields in TouchPrefsSchema.h. */
+    y += settingsRowLabel(body, y, 0, TR("E-paper refresh"), COLOR_TEXT, &g_font_12, 0) + 2;
+
+    y += settingsRowLabel(body, y, 0, TR("Minimum time between updates"), COLOR_SUB, &g_font_12, 0) + 2;
+    {
+      lv_obj_t* dd = lv_dropdown_create(body);
+      lv_dropdown_set_options(dd, "0.2 s\n0.4 s\n0.8 s\n1.5 s\n3 s\n5 s\n10 s");
+      const uint16_t cur = touchPrefsGetEpdMinRefreshMs();
+      uint16_t sel = 1;   // 0.4 s -- the default when the stored value is not a listed option
+      for (uint16_t i = 0; i < (sizeof(k_epd_interval_opts) / sizeof(k_epd_interval_opts[0])); ++i)
+        if (k_epd_interval_opts[i] == cur) { sel = i; break; }
+      lv_dropdown_set_selected(dd, sel);
+      lv_obj_set_width(dd, lv_pct(100));
+      lv_obj_set_pos(dd, 2, y);
+      styleDropdown(dd);
+      lv_obj_add_event_cb(dd, epdMinRefreshSelectCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += SC(34);
+    }
+
+    y += settingsRowLabel(body, y, 0, TR("Full de-ghost after"), COLOR_SUB, &g_font_12, 0) + 2;
+    {
+      lv_obj_t* dd = lv_dropdown_create(body);
+      lv_dropdown_set_options(dd, TR("Never\n3 updates\n5 updates\n10 updates\n20 updates\n40 updates"));
+      const uint8_t cur = touchPrefsGetEpdFullEveryN();
+      uint16_t sel = 2;   // "5 updates" -- the panel maker's own recommendation
+      for (uint16_t i = 0; i < (sizeof(k_epd_full_every_opts) / sizeof(k_epd_full_every_opts[0])); ++i)
+        if (k_epd_full_every_opts[i] == cur) { sel = i; break; }
+      lv_dropdown_set_selected(dd, sel);
+      lv_obj_set_width(dd, lv_pct(100));
+      lv_obj_set_pos(dd, 2, y);
+      styleDropdown(dd);
+      lv_obj_add_event_cb(dd, epdFullEverySelectCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += SC(34);
+    }
+    y += settingsRowLabel(body, y, 0,
+                          TR("a full refresh flashes the screen black to clear ghosting"),
+                          COLOR_SUB, &g_font_12, 0) + 2;
+
+    {
+      int h = settingsRowLabel(body, y, 6, TR("Full refresh on page change"), COLOR_SUB, nullptr, 56);
+      lv_obj_t* sw = lv_switch_create(body);
+      lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+      if (touchPrefsGetEpdFullOnScreen()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+      lv_obj_add_event_cb(sw, epdFullOnScreenToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += LV_MAX(SC(34), h + 12);
+    }
+    {
+      int h = settingsRowLabel(body, y, 6, TR("Full refresh on wake"), COLOR_SUB, nullptr, 56);
+      lv_obj_t* sw = lv_switch_create(body);
+      lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+      if (touchPrefsGetEpdFullOnWake()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+      lv_obj_add_event_cb(sw, epdFullOnWakeToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += LV_MAX(SC(34), h + 12);
+    }
+
+    {
+      lv_obj_t* b = lv_btn_create(body);
+      lv_obj_set_size(b, lv_pct(100), SC(34));
+      lv_obj_set_pos(b, 2, y);
+      styleButton(b);
+      lv_obj_add_event_cb(b, epdRefreshNowCb, LV_EVENT_CLICKED, nullptr);
+      lv_obj_t* l = lv_label_create(b);
+      useChainedFont(l);
+      lv_label_set_text(l, TR("Refresh screen now"));
+      lv_obj_center(l);
+      y += SC(42);
+    }
+#endif  // CAP_EINK
   /* Screen timeout (seconds, 0 = never). Persists in NVS via TouchPrefsStore. */
   {
     y += settingsRowLabel(body, y, 0, TR("Screen timeout (s, 0 = never, min 10)"), COLOR_SUB, &g_font_12, 0) + 2;
@@ -19210,9 +19499,9 @@ static const char* batteryGlyphForMv(uint16_t mv) {
 }
 
 static int batteryPercentFromMv(uint16_t mv) {
-#if defined(HAS_TDISPLAY_P4)
-  // This board has a BQ27220 fuel gauge, which coulomb-counts against its learned
-  // pack profile and therefore knows the actual state of charge. Ask it, and only
+#if defined(HAS_TDISPLAY_P4) || defined(HAS_TDECK_PRO)
+  // These boards carry a BQ27220 fuel gauge, which coulomb-counts against its
+  // learned pack profile and therefore knows the actual state of charge. Ask it, and only
   // fall back to the voltage curve below if it does not answer. Terminal voltage is
   // charger-driven, so the curve read 100% the moment USB was plugged in while the
   // pack was nearly empty, and never quite reached 100% resting on battery (#273).
@@ -32600,7 +32889,7 @@ static int append_settings_section(lv_obj_t* tab, int y, const char* title, lv_e
   lv_obj_align(tit, LV_ALIGN_TOP_LEFT, 14, 8);
 
   lv_obj_t* sub = lv_label_create(row);
-  lv_label_set_long_mode(sub, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_label_set_long_mode(sub, TOUCH_LABEL_LONG_OVERFLOW);
   lv_obj_set_width(sub, row_w - 48);
   lv_obj_set_height(sub, 18);
   lv_obj_set_style_text_font(sub, &g_font_12, LV_PART_MAIN);
@@ -36309,7 +36598,7 @@ static void refreshChatList(LvChatPanel& p) {
     // lv_list_add_btn creates: child[0]=icon label, child[1]=text label.
     lv_obj_t* text_lbl = lv_obj_get_child(btn, 1);
     if (text_lbl) {
-      lv_label_set_long_mode(text_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+      lv_label_set_long_mode(text_lbl, TOUCH_LABEL_LONG_OVERFLOW);
       // Leave room on the right for the gear + time + unread badge.
       lv_obj_set_width(text_lbl, lv_disp_get_hor_res(nullptr) - 116 - time_w - gear_w);
     }
@@ -37012,7 +37301,7 @@ static void refreshContactsList() {
       lv_point_t nsz;
       lv_txt_get_size(&nsz, san, &g_font_14, 0, 0, name_w, LV_TEXT_FLAG_NONE);
       const int name_line_h = lv_font_get_line_height(&g_font_14);
-      lv_label_set_long_mode(nm, (nsz.y > 2 * name_line_h) ? LV_LABEL_LONG_SCROLL_CIRCULAR
+      lv_label_set_long_mode(nm, (nsz.y > 2 * name_line_h) ? TOUCH_LABEL_LONG_OVERFLOW
                                                            : LV_LABEL_LONG_DOT);
       lv_obj_set_width(nm, name_w);
     }
@@ -44202,7 +44491,7 @@ static void buildGlobalStatusBar() {
   // Left zone — dynamic per-tab. Default to "MESHCOMOD"; updateGlobal-
   // StatusBar() swaps to the envelope+count on non-home tabs.
   g_statusbar.left_label = lv_label_create(g_statusbar.root);
-  lv_label_set_text(g_statusbar.left_label, TR("WADAMESH"));
+  setLabelIfChanged(g_statusbar.left_label, TR("WADAMESH"));
   lv_obj_set_style_text_color(g_statusbar.left_label, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.left_label, &g_font_14, LV_PART_MAIN);
   lv_obj_align(g_statusbar.left_label, LV_ALIGN_LEFT_MID, 6, 0);
@@ -44738,7 +45027,7 @@ static void updateGlobalStatusBar() {
     lv_label_set_recolor(g_statusbar.left_label, false);
     char sbuf[96];
     snprintf(sbuf, sizeof sbuf, "%s  %s", LV_SYMBOL_LEFT, disp);   // ‹ + address; tap the bar = back
-    lv_label_set_text(g_statusbar.left_label, sbuf);
+    setLabelIfChanged(g_statusbar.left_label, sbuf);
   } else
   if (app_page_title) {
     // A settings detail sheet OR a tool page is open: the bar carries its Back chevron +
@@ -44750,13 +45039,13 @@ static void updateGlobalStatusBar() {
     char sbuf[56];
     snprintf(sbuf, sizeof sbuf, "#%06X %s#  %s", (unsigned)(COLOR_ACCENT & 0xFFFFFF),
              LV_SYMBOL_LEFT, app_page_title);
-    lv_label_set_text(g_statusbar.left_label, sbuf);
+    setLabelIfChanged(g_statusbar.left_label, sbuf);
   } else
   if (inbox_overview) {
     // Chat/channel overview: the action buttons own the left side, and per-thread
     // unread state is already shown in the list — so keep the left zone blank (no
     // global ✉ badge competing with the buttons).
-    lv_label_set_text(g_statusbar.left_label, "");
+    setLabelIfChanged(g_statusbar.left_label, "");
   } else
   if (s_chat_title[0]) {
     // An open conversation surfaces its thread name here (the in-chat header bar
@@ -44769,17 +45058,17 @@ static void updateGlobalStatusBar() {
       char buf[64], ub[8];
       if (total_unread > 99) snprintf(ub, sizeof ub, "99+"); else snprintf(ub, sizeof ub, "%d", total_unread);
       snprintf(buf, sizeof(buf), LV_SYMBOL_ENVELOPE " %s  %s", ub, s_chat_title);
-      lv_label_set_text(g_statusbar.left_label, buf);
+      setLabelIfChanged(g_statusbar.left_label, buf);
       unread_badge = true;
     } else {
-      lv_label_set_text(g_statusbar.left_label, s_chat_title);
+      setLabelIfChanged(g_statusbar.left_label, s_chat_title);
     }
   } else
 #if defined(HAS_TDECK_GT911) || defined(HAS_THINKNODE_M9)
   if (s_fullscreen_view && s_fullscreen_title[0]) {
     // A fullscreen tool view (Terminal / Files) borrows the left zone for its
     // title, so it can drop its own header row and use the full height.
-    lv_label_set_text(g_statusbar.left_label, s_fullscreen_title);
+    setLabelIfChanged(g_statusbar.left_label, s_fullscreen_title);
   } else
 #endif
   {
@@ -44797,13 +45086,13 @@ static void updateGlobalStatusBar() {
                                LV_PART_MAIN);
     if (tab == MAP_TAB_INDEX) {
       // On the immersive map the left zone carries the required OSM attribution.
-      lv_label_set_text(g_statusbar.left_label, s_map_style == 1
+      setLabelIfChanged(g_statusbar.left_label, s_map_style == 1
           ? TR("\xC2\xA9 OpenTopoMap")      // © OpenTopoMap (CC-BY-SA) — full text in Options -> Info
           : TR("\xC2\xA9 OpenStreetMap"));
     } else if (tab == HOME_TAB_INDEX && touchPrefsGetHideNodeName()) {
       // Display setting: hide the device name. Clear the left zone — the clock is
       // parked here instead (see the clock-placement block below).
-      lv_label_set_text(g_statusbar.left_label, "");
+      setLabelIfChanged(g_statusbar.left_label, "");
       s_left_home_name[0] = '\0';   // force marquee re-config if the name returns
       s_left_home_cfg = false;
     } else if (tab == HOME_TAB_INDEX) {
@@ -44837,9 +45126,9 @@ static void updateGlobalStatusBar() {
         lv_obj_set_width(g_statusbar.left_label,
                          (sb_w >= 600) ? (sb_w - SC(190)) : (sb_w >= 300) ? 100 : 66);   // #47a: narrower window on the 240px V4 bar so a long name can't run into the clock
 #endif
-        lv_label_set_long_mode(g_statusbar.left_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_label_set_long_mode(g_statusbar.left_label, TOUCH_LABEL_LONG_OVERFLOW);
         lv_obj_set_style_anim_speed(g_statusbar.left_label, 14, LV_PART_MAIN);  // slow, readable marquee
-        lv_label_set_text(g_statusbar.left_label, nm);
+        setLabelIfChanged(g_statusbar.left_label, nm);
       }
       s_left_home_cfg = true;
     } else {
@@ -44848,13 +45137,13 @@ static void updateGlobalStatusBar() {
         char buf[24];
         if (total_unread > 99) snprintf(buf, sizeof(buf), LV_SYMBOL_ENVELOPE "  99+");
         else                   snprintf(buf, sizeof(buf), LV_SYMBOL_ENVELOPE "  %d", total_unread);
-        lv_label_set_text(g_statusbar.left_label, buf);
+        setLabelIfChanged(g_statusbar.left_label, buf);
         unread_badge = true;
       } else {
         // No unread → blank the left zone entirely. Operator complaint was
         // the envelope was always lit even with an empty inbox, which read
         // as "you have mail" 24/7.
-        lv_label_set_text(g_statusbar.left_label, "");
+        setLabelIfChanged(g_statusbar.left_label, "");
       }
     }
   }
@@ -45171,7 +45460,7 @@ static void updateGlobalStatusBar() {
 // 250 ms refresh tick with byte-identical text needlessly redraws ~8 labels 4x/s.
 // Comparing against the label's CURRENT text also makes this safe across home/tab
 // rebuilds (no module-static "last value" that can outlive the widget).
-static inline void setLabelIfChanged(lv_obj_t* lbl, const char* txt) {
+inline void setLabelIfChanged(lv_obj_t* lbl, const char* txt) {
   if (lbl && strcmp(lv_label_get_text(lbl), txt) != 0) lv_label_set_text(lbl, txt);
 }
 
@@ -45314,7 +45603,18 @@ static void refreshStatusLabels() {
   const bool home_active = (active_tab == HOME_TAB_INDEX);
   if (home_active) refreshHomeBattery();
   // Push a TX/RX sample onto the home chart: delta packets since last tick.
-  if (home_active && s_home_chart && s_home_chart_tx && s_home_chart_rx) {
+#if CAP_SLOW_DISPLAY
+  // ...but not on every tick here. A chart point is a guaranteed pixel change,
+  // so on e-paper each one costs a panel update no byte-diff can skip. 5 s is
+  // the floor; the delta accumulates across skipped ticks rather than being
+  // dropped, so the series still totals correctly -- it is coarser, not wrong.
+  static uint32_t s_chart_next_ms = 0;
+  const bool chart_due = (int32_t)(millis() - s_chart_next_ms) >= 0;
+  if (chart_due) s_chart_next_ms = millis() + 5000;
+#else
+  const bool chart_due = true;
+#endif
+  if (chart_due && home_active && s_home_chart && s_home_chart_tx && s_home_chart_rx) {
     static uint32_t last_tx = 0;
     static uint32_t last_rx = 0;
     uint32_t cur_tx = the_mesh.getNumSentFlood() + the_mesh.getNumSentDirect();
@@ -53478,6 +53778,16 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
 #if defined(HAS_PAGER_KEYBOARD)
     pagerKeyboardBegin();
 #endif
+#if CAP_EINK
+    // Install the panel's BUSY-wait pump only NOW, after the keyboard is up:
+    // the hook calls pagerKeyboardPoll(), and GxEPD2 will already have done its
+    // first (boot-splash) refresh before this point.
+    GDEQ031EpdDisplay::setBusyHook(&epdBusyHook);
+    // Apply the persisted refresh policy over the class's built-in defaults.
+    // ::display, not display -- UITask::begin takes a DisplayDriver* parameter
+    // of the same name, which shadows the global concrete instance here.
+    ::display.setRefreshPolicy(touchPrefsGetEpdMinRefreshMs(), touchPrefsGetEpdFullEveryN());
+#endif
 #if defined(HAS_PAGER_ENCODER)
     pagerEncoderBegin();
 #endif
@@ -53522,7 +53832,25 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       g_lv.indev_drv.type    = LV_INDEV_TYPE_POINTER;
       g_lv.indev_drv.read_cb = lvglTouchRead;
       g_lv.indev_drv.disp    = lv_disp_get_default();
-      if (!lv_indev_drv_register(&g_lv.indev_drv)) pushDiagLine("LVGL indev failed");
+      lv_indev_t* touch_indev = lv_indev_drv_register(&g_lv.indev_drv);
+      if (!touch_indev) pushDiagLine("LVGL indev failed");
+#if CAP_SLOW_DISPLAY
+      // Kill flick momentum. Written to the REGISTERED driver, not to the
+      // pre-register struct and not from a theme apply_cb: LVGL's
+      // lv_hal_indev.c copies its own LV_INDEV_DEF_SCROLL_THROW over whatever
+      // was set beforehand, and lv_obj_constructor re-ORs SCROLL_MOMENTUM after
+      // lv_theme_apply has run. Post-register assignment is the one place that
+      // sticks.
+      //
+      // On e-paper momentum is actively harmful: the list keeps moving after
+      // the finger lifts, so the frame that finally gets committed ~0.7 s later
+      // is not the one the user aimed at. Zero throw makes a drag land exactly
+      // where it was released.
+      if (touch_indev) {
+        touch_indev->driver->scroll_throw = 0;
+        touch_indev->driver->scroll_limit = 12;   // slightly easier to start a deliberate drag
+      }
+#endif
     }
 #endif
 
@@ -54654,6 +54982,12 @@ void UITask::wakeScreen() {
   _screen_off    = false;
   _manual_lock   = false;
   _last_input_ms = millis();
+#if CAP_EINK
+  // E-paper keeps its last frame with the controller unpowered, so "screen off"
+  // leaves a readable image sitting there -- for hours, which is exactly the
+  // condition under which ghosting sets in. Clear it on the way back, if asked.
+  if (touchPrefsGetEpdFullOnWake()) ::display.requestRefresh(true);
+#endif
 }
 
 void UITask::lockScreen() {
@@ -57006,6 +57340,13 @@ void UITask::loop() {
 #endif
 #if !defined(HAS_TANMATSU)
   webMirrorTick();   // coalesced, rate-capped, backpressure-gated send of the dirty region
+#endif
+#if CAP_EINK
+  // Commit this frame to the e-paper, if it has settled and policy allows. Must
+  // stay HERE: after lv_timer_handler (so the frame's bands are in the shadow),
+  // outside the LVGL render call stack, and after the last early return.
+  uiCp("ui:epd");
+  epdServiceTick();
 #endif
 #if defined(HAS_TANMATSU)
   if (s_nav_entered_obj) {

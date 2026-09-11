@@ -9,7 +9,7 @@
 namespace TouchPrefsSchema {
 
 static constexpr uint16_t MAGIC = 0x5743;   // 'WC' (WadaCfg)
-static constexpr uint8_t CURRENT_VERSION = 56;   // v49: fem_lna default flip on the V4-R8; v50: map tile z/x/y line off by default (no new fields); v51: console_mode (boot into the text console; new trailing field, default OFF); v52: console_monitor (show incoming messages in the console, default ON); v54: boot_wifi_time + boot_wifi_open (cold-boot saved-Wi-Fi time sync, #383; both OFF); v55: loud_alerts (resonant-pitch chime, #388; OFF); v56: theme_mode (Day/Night firmware theme, #296; default Night)
+static constexpr uint8_t CURRENT_VERSION = 57;   // v49: fem_lna default flip on the V4-R8; v50: map tile z/x/y line off by default (no new fields); v51: console_mode (boot into the text console; new trailing field, default OFF); v52: console_monitor (show incoming messages in the console, default ON); v54: boot_wifi_time + boot_wifi_open (cold-boot saved-Wi-Fi time sync, #383; both OFF); v55: loud_alerts (resonant-pitch chime, #388; OFF); v56: theme_mode (Day/Night firmware theme, #296; default Night); v57: epd_* e-paper refresh policy (T-Deck Pro; four trailing fields, inert on every other board)
 static constexpr uint8_t BROKEN_MID_INSERT_VERSION = 44;
 
 // Persisted byte layout. New fields must be appended at the end: older blobs
@@ -103,6 +103,19 @@ struct __attribute__((packed)) Config {
   // 1-2.6 kHz the chime uses. This shifts the same chime up into that band (#388).
   uint8_t  loud_alerts;      // play the notification chime at the piezo's resonant pitch
   uint8_t  theme_mode;       // v56: 0 Night, 1 Day
+  // v57 -- e-paper refresh policy (T-Deck Pro). Stored on every board so the
+  // blob layout stays board-independent; only CAP_EINK builds read them.
+  //
+  // A bistable panel cannot simply be redrawn when something changes: each
+  // update costs 0.7-1.1 s and visibly flashes, and partial updates accumulate
+  // ghosting that only a full de-ghost cycle clears. Both halves of that
+  // trade-off are things a user legitimately wants to tune -- someone reading
+  // static text wants near-zero flashing, someone watching a chart wants
+  // freshness -- so the policy is a preference rather than a constant.
+  uint16_t epd_min_refresh_ms;   // floor between panel commits; higher = calmer, staler
+  uint8_t  epd_full_every_n;     // full de-ghost after N partials; 0 = never automatically
+  uint8_t  epd_full_on_screen;   // full refresh when the whole screen changes (tab/page switch)
+  uint8_t  epd_full_on_wake;     // full refresh on wake, to clear ghosting accrued while asleep
 };
 
 static constexpr size_t HEADER_SIZE = offsetof(Config, bright);
@@ -118,7 +131,7 @@ static_assert(offsetof(Config, web_mirror) == offsetof(Config, rx_queue) + sizeo
 // whichever board is using the file backend. 114 bytes today.
 static_assert(sizeof(Config) <= 2048,
               "Config exceeds the SdNvsPrefs value cap; prefs would silently stop saving");
-static_assert(offsetof(Config, theme_mode) + sizeof(Config::theme_mode) == sizeof(Config),
+static_assert(offsetof(Config, epd_full_on_wake) + sizeof(Config::epd_full_on_wake) == sizeof(Config),
               "new preference fields must remain trailing");
 // lang_file must stay immediately before the tail, or a v48-era blob overlays
 // onto the wrong bytes. Checking both ends means the next person to append is
@@ -141,6 +154,18 @@ static_assert(offsetof(Config, boot_wifi_open) ==
 static_assert(offsetof(Config, theme_mode) ==
                   offsetof(Config, loud_alerts) + sizeof(Config::loud_alerts),
               "theme_mode must follow loud_alerts");
+static_assert(offsetof(Config, epd_min_refresh_ms) ==
+                  offsetof(Config, theme_mode) + sizeof(Config::theme_mode),
+              "epd_min_refresh_ms must follow theme_mode");
+static_assert(offsetof(Config, epd_full_every_n) ==
+                  offsetof(Config, epd_min_refresh_ms) + sizeof(Config::epd_min_refresh_ms),
+              "epd_full_every_n must follow epd_min_refresh_ms");
+static_assert(offsetof(Config, epd_full_on_screen) ==
+                  offsetof(Config, epd_full_every_n) + sizeof(Config::epd_full_every_n),
+              "epd_full_on_screen must follow epd_full_every_n");
+static_assert(offsetof(Config, epd_full_on_wake) ==
+                  offsetof(Config, epd_full_on_screen) + sizeof(Config::epd_full_on_screen),
+              "epd_full_on_wake must follow epd_full_on_screen");
 
 // Overlay a persisted blob on caller-provided defaults. Beta 57 wrote v44 with
 // retry_echo inserted before web_mirror, shifting every later value. That blob

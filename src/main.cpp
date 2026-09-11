@@ -17,6 +17,7 @@
 #include "helpers/esp32/SdNvsPrefs.h"        // route prefs to file storage (SD/SPIFFS), off NVS
                                              // (quoted: use wadamesh's src/ copy, not the lib's stale one)
 #include "helpers/esp32/BootTimeSync.h"      // opt-in cold-boot clock sync over saved Wi-Fi (#383)
+#include "ui-touch/device_caps.h"        // CAP_EINK — the boot splash differs on e-paper
 #include "ui-touch/i18n.h"                    // translated Pager transport-state alerts
 #include "wadamesh_mark_rgb.h"               // anti-aliased mesh-mark (RGB565) for the pre-LVGL boot screen
 #if defined(HAS_TDECK_PRO)
@@ -876,11 +877,26 @@ void setup() {
     // Explicit black: startFrame()'s default is UIColor::window_bkg, and on boards
     // whose DISPLAY_CLASS is a core driver the 1.17 core's palette makes that WHITE
     // (the boot logo grew a white border). Our pre-LVGL screens are always dark.
+#if CAP_EINK
+    // E-paper takes the text path, not the bitmap. WADAMESH_MARK_RGB565 is
+    // white-on-black artwork (src/wadamesh_mark_rgb.h:1), and this board maps a
+    // dark pixel to ink -- so blitting it would paint a solid-ink screen with
+    // white letters knocked out of it. That is slow, ghosts badly, and is the
+    // opposite of what the LVGL UI hands over to. startFrame() clears to paper
+    // and the text path thresholds the same way the LVGL path does, so this
+    // renders as black text on white and the hand-off is seamless.
+    display.startFrame((ColorVal)0xFFFF);
+    display.setColor((ColorVal)0x0000);
+    display.setTextSize(2);
+    display.drawTextCentered(display.width() / 2, display.height() / 2 - 8, "WADAMESH");
+    display.endFrame();
+#else
     display.startFrame((ColorVal)0x0000);
     display.writePixelsRGB565((display.width()  - WADAMESH_MARK_W) / 2,
                               (display.height() - WADAMESH_MARK_H) / 2,
                               WADAMESH_MARK_W, WADAMESH_MARK_H, WADAMESH_MARK_RGB565);
     display.endFrame();
+#endif
   }
 #endif
 

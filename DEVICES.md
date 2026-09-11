@@ -17,6 +17,7 @@ USB) and the [GitHub releases](https://github.com/ALLFATHER-BV/wadamesh/releases
 | Heltec V4-R8 + Expansion Kit V2 | ESP32-S3 (8 MB octal PSRAM), SX1262 | 2.4" touch (CHSC6x) | Web flasher | Beta (new in beta_45) | As the V4 plus microSD and the Expansion Kit sensors; buzzer supported |
 | LilyGo T-Display P4 | ESP32-P4 + ESP32-C6, SX1262 | AMOLED or TFT-LCD, touch | Web flasher (AMOLED) or the .bin for the LCD SKU | Beta (new in beta_45) | Two screen SKUs; fuel-gauge battery reporting, full TX power |
 | Attaky Mesh Series | ESP32-S3, SX1262 | Touch display + front D-pad | Web flasher | Beta (new in beta_47) | Community port by attakygit (#158/#169); detachable keyboard supported; the front D-pad + SELECT navigate the UI |
+| LilyGo T-Deck Pro | ESP32-S3, SX1262 | 3.1" 240x320 e-paper (GDEQ031T10/UC8253), CST328/CST3530 touch + TCA8418 QWERTY | Web flasher | Beta | **Never run on hardware.** Initial port (#62): black-and-white UI on a bistable panel, ~1 s refresh with a configurable de-ghost cycle (Settings -> Display). Touch, keyboard, GPS, microSD and the BQ27220 gauge are wired but unverified; the keymap is transcribed from two upstream sources, not measured |
 
 ## Feature notes per board
 
