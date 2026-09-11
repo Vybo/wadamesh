@@ -19,6 +19,13 @@
 #include "helpers/esp32/BootTimeSync.h"      // opt-in cold-boot clock sync over saved Wi-Fi (#383)
 #include "ui-touch/i18n.h"                    // translated Pager transport-state alerts
 #include "wadamesh_mark_rgb.h"               // anti-aliased mesh-mark (RGB565) for the pre-LVGL boot screen
+#if defined(HAS_TDECK_PRO)
+  // The Pro's target.h only FORWARD-DECLARES its display class (see the long note
+  // there: including it from target.h breaks the vendored core's LDF scan). The
+  // boot splash below calls startFrame()/writePixelsRGB565()/endFrame() on it, so
+  // this TU needs the complete type.
+  #include <GDEQ031EpdDisplay.h>
+#endif
 #include "ui-touch/TouchSleep.h"             // idle light-sleep controller (loopEnd called at end of loop())
 #endif
 
@@ -55,7 +62,7 @@ static uint32_t _atoi(const char* sp) {
     #include <SD_MMC.h>
     #include <WioTrackerL2Io.h>
   #endif
-  #if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
+  #if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_TDECK_PRO)
     #include <SD.h>
     #include "SdFastClock.h"   // post-mount operating-clock raise (SD_SPI_FAST_HZ boards)
     #include <Preferences.h>
@@ -269,7 +276,7 @@ extern volatile uint8_t g_wifi_last_disc_reason;
 
 #include "esp_task_wdt.h"   // task-watchdog reconfigure — see setup() (GH #56)
 
-#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
+#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_TDECK_PRO)
 // ---- SPIFFS -> SD migration (fixes the beta_36 "lost my profile" upgrades) ----
 // Users who flipped "Store data on SD" before beta_36 ran with the toggle IGNORED
 // (the flag never survived a reboot), so their identity/prefs/contacts kept living
@@ -1043,7 +1050,7 @@ void setup() {
     Serial.println("[BOOT] wio-l2 SD_MMC unavailable; using SPIFFS");
   }
 #endif
-#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
+#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_TDECK_PRO)
   {
    #if defined(TLORA_PAGER)
     extern SPIClass* tloraPagerSharedSPI();    // display/radio/SD shared bus
@@ -1336,7 +1343,7 @@ void setup() {
   #if defined(HAS_WIO_TRACKER_L2)
     SdNvsPrefs::useFile(sd_storage ? (fs::FS*)&SD_MMC : (fs::FS*)&SPIFFS,
                         sd_storage ? "/meshcomod" : "/prefs");
-  #elif defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
+  #elif defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_TDECK_PRO)
     SdNvsPrefs::useFile(sd_storage ? (fs::FS*)&SD : (fs::FS*)&SPIFFS,
                         sd_storage ? "/meshcomod" : "/prefs");
   #else

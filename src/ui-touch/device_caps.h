@@ -35,6 +35,24 @@
   #define CAP_OTA          1
   #define CAP_LOCK_SCREEN  1
 
+#elif defined(HAS_TDECK_PRO)            // ===== LilyGo T-Deck Pro (ESP32-S3, e-paper) =====
+  // MUST stay ABOVE the HAS_TDECK_GT911 arm and must NOT define that macro.
+  // HAS_TDECK_GT911 is not the capability gate its name suggests — none of its
+  // branches are about touch hardware (that is already abstracted behind
+  // CAP_TOUCH + the device-neutral heltecV4CapTouch* API). What it actually
+  // gates is the T-Deck's microSD wiring, its I2S audio, its idle light-sleep,
+  // its 320x240 landscape layout, its OTA binary name, and a branch that
+  // bit-bangs raw ST7789 SLPIN/SLPOUT over its own HSPI instance. That last one
+  // would write ST7789 sleep commands into a UC8253 e-paper controller.
+  #define CAP_TOUCH        1   // CST328 / CST3530 capacitive panel
+  #define CAP_ROTATABLE    0   // e-paper has no MADCTL; native 240x320 portrait only
+  #define CAP_LARGE_SCREEN 0   // 240x320
+  #define CAP_SD           1   // microSD (CS 48) on the shared EPD/LoRa SPI bus
+  #define CAP_FILESYSTEM   1
+  #define CAP_GPS          1   // u-blox MIA-M10Q, rail-switched on GPIO 39
+  #define CAP_OTA          1   // 16 MB, dual A/B app slots
+  #define CAP_LOCK_SCREEN  1
+
 #elif defined(HAS_TDECK_GT911)          // ===== LilyGo T-Deck (ESP32-S3) =====
   #define CAP_TOUCH        1   // capacitive touchscreen (pointer input)
   #define CAP_ROTATABLE    0   // panel is fixed landscape
@@ -182,7 +200,13 @@
 // CAP_TRACKBALL` block); the Attaky drains its expander queue in attakyNavPump().
 // NOTE: the Attaky is the first board here with CAP_KEYBOARD == 0, so anything
 // this flag pulls in must not assume a physical keyboard is also compiled.
-#if defined(HAS_TANMATSU) || defined(HAS_TDECK_TRACKBALL) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(ATTAKY_MESH_SERIES)
+// The T-Deck Pro joins this list on KEYBOARD grounds, not trackball ones — it
+// has no trackball at all. It has to: the HAS_PAGER_KEYBOARD integration blocks
+// in UITask.cpp call navOpenChatPanel/navGoToMainTab/navPushTap/s_nav_group
+// directly, and those only exist under this flag. The pager never noticed the
+// coupling because it has no touchscreen, so nav is unconditionally on there.
+// Leaving the Pro out does not degrade gracefully — it fails to link.
+#if defined(HAS_TANMATSU) || defined(HAS_TDECK_TRACKBALL) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(ATTAKY_MESH_SERIES) || defined(HAS_TDECK_PRO)
   #define CAP_KEYPAD_NAV 1
 #else
   #define CAP_KEYPAD_NAV 0
@@ -209,7 +233,7 @@
 // A true power cut can leave these boards without trustworthy wall time. The
 // T-Deck has no RTC; the M9's PCF8563 can report lost integrity after shutdown.
 // Both can opt into the bounded, pre-transport saved-Wi-Fi sync from #383.
-#if defined(HAS_TDECK_GT911) || defined(HAS_THINKNODE_M9)
+#if defined(HAS_TDECK_GT911) || defined(HAS_THINKNODE_M9) || defined(HAS_TDECK_PRO)
   #define CAP_BOOT_TIME_SYNC 1
 #else
   #define CAP_BOOT_TIME_SYNC 0
@@ -224,6 +248,34 @@
   #define CAP_ROUND_CORNERS 1
 #else
   #define CAP_ROUND_CORNERS 0
+#endif
+
+// Bistable panel: 1 bpp, no backlight to turn the image off, and a refresh that
+// costs 0.7-1.1 s and BLOCKS the loop task. This is the first cap in this file
+// that describes PANEL TECHNOLOGY rather than a peripheral — nothing here could
+// express "e-ink" before, which is exactly why the T-Deck's board macro looked
+// reusable for the Pro.
+//
+// What it gates, in three groups:
+//   * colour — a board-gated light palette, because the stock dark theme
+//     (COLOR_BG 0x000000) inverts to a near-solid-ink screen;
+//   * motion — animations, marquees, momentum scrolling and press transitions
+//     all become per-frame panel updates, so they are compiled out rather than
+//     merely slowed;
+//   * cadence — timers that repaint on a 250 ms tick are re-armed to seconds.
+//
+// CAP_SLOW_DISPLAY is deliberately a SEPARATE flag even though only one board
+// sets both today: a future reflective-LCD or shared-bus board could want the
+// cadence rules without the 1-bpp colour rules, and a fast mono OLED the
+// reverse. Gate on whichever one the code actually depends on.
+#if defined(HAS_TDECK_PRO)
+  #define CAP_EINK         1
+  #define CAP_MONO         1   // 1 bpp: every colour decision collapses to ink or paper
+  #define CAP_SLOW_DISPLAY 1   // no animation; timers re-armed to e-paper cadence
+#else
+  #define CAP_EINK         0
+  #define CAP_MONO         0
+  #define CAP_SLOW_DISPLAY 0
 #endif
 
 // ---- Capabilities aliased to existing device-neutral macros -----------------

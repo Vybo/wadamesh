@@ -75,8 +75,8 @@ static void* wadaMp3Scratch() { return s_wada_mp3_scratch; }
   static inline esp_err_t esp_core_dump_image_erase() { return ESP_FAIL; }
   #endif
 #endif
-#if defined(HAS_TDECK_GT911) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
-  #include <SD.h>             // microSD — T-Deck/M9 on the LoRa SPI, V4-R8 on the TFT SPI
+#if defined(HAS_TDECK_GT911) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
+  #include <SD.h>             // microSD — T-Deck/M9/Pro on the LoRa SPI, V4-R8 on the TFT SPI
   #include "SdFastClock.h"    // post-mount operating-clock raise (SD_SPI_FAST_HZ boards)
   #include "sd_diskio.h"      // internal Arduino-SD drive helpers (sdcard_init / sd_*_raw)
   extern SPIClass* tdeckSharedSPI();
@@ -183,6 +183,8 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
     #else
       #include <RM69A10Display.h>            // RM69A10 MIPI-DSI AMOLED (default SKU) on the T-Display P4
     #endif
+  #elif defined(HAS_TDECK_PRO)
+    #include <GDEQ031EpdDisplay.h>   // GDEQ031T10/UC8253 e-paper via GxEPD2
   #else
     #include <helpers/ui/ST7789LCDDisplay.h>
   #endif
@@ -238,6 +240,8 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
     extern LGFXDisplay display;
   #elif defined(HAS_TDISPLAY_P4)
     extern DISPLAY_CLASS display;            // RM69A10Display (AMOLED) or HI8561Display (LCD) — set in CMakeLists
+  #elif defined(HAS_TDECK_PRO)
+    extern DISPLAY_CLASS display;            // GDEQ031EpdDisplay — e-paper, not an ST7789
   #else
     extern ST7789LCDDisplay display;
   #endif
@@ -2137,6 +2141,22 @@ static lv_indev_drv_t s_nav_keypad_drv;
 // trackball block above uses — fed by handleHwKey() instead — so it needs the SAME three
 // symbols that block declares for the T-Deck (s_kbd_nav/s_tb_nav/s_nav_keypad_drv), just
 // without any of the actual trackball-cursor state above (no trackball on this board).
+static bool           s_kbd_nav        = true;
+static bool           s_tb_nav         = false;  // no trackball — read by the shared nav-rebuild gate, never set
+static lv_indev_drv_t s_nav_keypad_drv;
+#endif
+
+#if defined(HAS_TDECK_PRO)
+// T-Deck Pro: touch IS the primary input (unlike the M9/Tanmatsu), and the
+// TCA8418 keyboard is a second one — so this takes the same CAP_KEYPAD_NAV
+// "secondary indev" path as the Attaky and M9 blocks above, fed from
+// handleHwKey(). Same three symbols, no trackball state: this board has no
+// trackball at all.
+//
+// Nav defaults ON here rather than following the T-Deck's opt-in pref, because
+// on e-paper focus nav is the CHEAPER input path: moving a focus ring repaints
+// two small rectangles, whereas a touch-driven cursor would repaint a region
+// per frame on a panel that takes ~0.7 s to show one.
 static bool           s_kbd_nav        = true;
 static bool           s_tb_nav         = false;  // no trackball — read by the shared nav-rebuild gate, never set
 static lv_indev_drv_t s_nav_keypad_drv;
@@ -19807,7 +19827,7 @@ static char      s_fm_path[160]  = {0};     // current dir within s_fm_fs (e.g. 
 // a generic fs::FS*; only &SD is real microSD I/O (Internal = SPIFFS). Browsing
 // (fmRefresh) and the file open/save paths call this; mutations re-list via
 // fmRefresh, so they blip the LED too.
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
 static inline bool fmIsSd(fs::FS* fs) { return fs == &SD; }   // Arduino SD (T-Deck/pager/M9 LoRa bus, V4-R8 TFT bus)
 #elif defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4) || defined(HAS_WIO_TRACKER_L2)
 static inline bool fmIsSd(fs::FS* fs) { return fs == &SD_MMC; }   // microSD on SDMMC slot 0
@@ -21003,7 +21023,7 @@ static void fmFmtSize64(uint64_t bytes, char* out, size_t outsz) {
   else                                     snprintf(out, outsz, "%.1f GB", bytes / (1024.0 * 1024 * 1024));
 }
 
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)   // microSD mount/format helpers — Arduino SD on the shared SPI bus
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)   // microSD mount/format helpers — Arduino SD on the shared SPI bus
 // One shared-SPI accessor per board: the T-Deck/M9 expose their pre-begun SPIClass
 // via tdeckSharedSPI()/m9SharedSPI(); the V4-R8's microSD shares its TFT FSPI bus
 // (heltecV4R8SharedSPI()); the pager accessor returns the same TFT_eSPI SPIClass
@@ -23265,7 +23285,7 @@ static ReaderLocalResult readerReadLocal(const char* url, uint8_t* raw, size_t c
     s_reader_sd_busy = false;
     storage_claimed = false;
   };
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
   s_reader_sd_busy = true;
   s_reader_sd_owner = xTaskGetCurrentTaskHandle();
   storage_claimed = true;
@@ -27797,7 +27817,13 @@ static int wifiScanWatchdogSafe(uint32_t cap_ms, uint16_t per_chan_ms = 300) {
 // MUST match the release artifact names exactly, or the self-update 404s. Every touch board is
 // dual-slot OTA-capable (CAP_OTA=1 + app0/app1 partitions + FIRMWARE_OTA_ENV) EXCEPT the Tanmatsu
 // (AppFS/launcher, CAP_OTA=0, never reaches this file). Keep this chain in sync when adding a board.
-#if defined(HAS_TDECK_GT911)
+// The Pro arm MUST precede the T-Deck arm and must never fall through to the
+// #else: this chain decides which binary the device downloads and flashes into
+// itself, so a missing arm here does not misrender something — it installs
+// another board's firmware.
+#if defined(HAS_TDECK_PRO)
+static const char* const OTA_BIN_NAME = "wadamesh-tdeck-pro";
+#elif defined(HAS_TDECK_GT911)
 static const char* const OTA_BIN_NAME = "wadamesh-tdeck";
 #elif defined(HAS_TDISPLAY_P4)
   #if defined(HAS_TDP4_LCD)
@@ -28413,7 +28439,7 @@ static void tileFetchTaskFn(void* arg) {
             } else {
               ++s_tile_fetch_short_wr;
               s_tile_fetch_last_wr = 'P';            // short/failed disk write (card full or SD error)
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
               if (s_tile_fs == &SD) sdNoteIoFailure();   // wedge tell (worker task — stamp only)
 #endif
             }
@@ -28421,7 +28447,7 @@ static void tileFetchTaskFn(void* arg) {
         } else {
           ++s_tile_fetch_open_fail;
           s_tile_fetch_last_wr = 'O';                // open("w") failed: dir missing / write-protect / SD bus
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
           if (s_tile_fs == &SD) sdNoteIoFailure();       // wedge tell (worker task — stamp only)
 #endif
         }
@@ -28829,14 +28855,14 @@ static bool loadTileJpeg(uint8_t z, int32_t x, int32_t y,
   // re-downloaded forever and rendered nothing (#tiles). open() is the real existence test; read up to
   // the 100 KB writer cap and use the ACTUAL bytes read. (S3 boards: f.size() works there, but this is
   // equally correct — a transient 100 KB PSRAM buffer per tile, freed right after decode.)
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
   // Launcher installs cache tiles on the raw SD (s_tile_fs == &SD) — same
   // dead-card short-circuit as the SD-pack path above.
   if (s_tile_fs == &SD && s_sd_fail_note_ms) return false;
 #endif
   File f = tileCacheOpen(path, "r");
   if (!f) {
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
     if (s_tile_fs == &SD) sdReadFailedCardDead();
 #endif
     return false;
@@ -50479,7 +50505,7 @@ static bool uiDataFsIsSdCard() {
   if (!uiDataFsReady()) return false;
 #if defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4) || defined(HAS_WIO_TRACKER_L2)
   return s_ui_data_fs == &SD_MMC;
-#elif defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#elif defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
   return s_ui_data_fs == &SD;
 #else
   return false;
@@ -50496,7 +50522,7 @@ static File uiDataOpen(const char* name, const char* mode) {
   if (!uiDataFsReady()) return File();
   char p[80]; snprintf(p, sizeof p, "%s%s", s_ui_data_root, name);
   File f = s_ui_data_fs->open(p, mode);
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
   // A failed WRITE open on the SD-backed history store is the wedge tell (reads
   // fail legitimately on first boot). Called from the loop task AND the core-0
   // history worker — sdNoteIoFailure is a volatile stamp, safe from both.
@@ -51150,7 +51176,7 @@ static bool uiMsgsWriteResult(bool ok) {
     s_msgs_write_fail_ms = m ? m : 1;
     s_msgs_write_fail_epoch = ep;
     if (s_msgs_write_fails < 0xFFFFu) s_msgs_write_fails = s_msgs_write_fails + 1;
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
     if (s_ui_data_fs == &SD) sdNoteIoFailure();
 #endif
   }
@@ -55572,7 +55598,7 @@ static void sdHealthTick() {
 #endif
       markSdIo();
       if (g_lv.task) g_lv.task->showAlert(TR("SD card remounted"), 1800);
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
       // Land the RAM ring on the card promptly, not up to 30+ s later: every
       // message received while the card was out is only in RAM. Armed as an
       // OFF-THREAD flush — a synchronous write here froze the UI for >30 s on
@@ -55699,7 +55725,7 @@ static void sdHealthTick() {
     s_sd_data_warn_next_ms = 0;
 #endif
     if (g_lv.task) g_lv.task->showAlert(TR("SD card remounted"), 1800);
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
     if (!s_ui_data_fs) uiDataFsReady();
     if (s_ui_data_fs == &SD) {
       SD.mkdir("/meshcomod");                          // fresh replacement card: recreate the data root
@@ -56363,7 +56389,7 @@ void UITask::loop() {
         // unmountable card spikes current / churns the bus and can reset the board.
         if (!sdRuntimeLifecycleBusy() && now >= s_sd_retry_after_ms && fmSdTryMount()) {
           showAlert(TR("SD card inserted"), 1500);
-#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8)
+#if defined(HAS_TDECK_GT911) || defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HELTEC_LORA_V4_R8) || defined(HAS_TDECK_PRO)
           if (!s_ui_data_fs) uiDataFsReady();
           if (s_ui_data_fs == &SD) {
             SD.mkdir("/meshcomod"); // fresh replacement card: recreate the data root

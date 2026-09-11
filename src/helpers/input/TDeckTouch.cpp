@@ -7,7 +7,11 @@
 // driver outputs coordinates already in the 320x240 landscape screen space.
 // The raw->screen mapping is calibrated against the panel; flip the TDECK_TS_*
 // switches below if taps land mirrored/rotated.
-#if defined(HAS_TOUCH_UI) && !defined(HAS_HELTEC_V4_CAP_TOUCH) && !defined(HAS_RAK_TAP_V2) && defined(ESP32)
+// NOTE the negative-guard list: this file is the DEFAULT touch implementation
+// for any HAS_TOUCH_UI board, so every board with its own controller has to opt
+// OUT here or it silently links the GT911 driver instead of its own.
+// HAS_TDECK_PRO is a CST328/CST3530 (see TDeckProTouch.cpp).
+#if defined(HAS_TOUCH_UI) && !defined(HAS_HELTEC_V4_CAP_TOUCH) && !defined(HAS_RAK_TAP_V2) && !defined(HAS_TDECK_PRO) && defined(ESP32)
 
 #include "HeltecV4CapTouch.h"
 #include "TDeckKeyboard.h"                 // shares this I2C bus; polled from the touch task

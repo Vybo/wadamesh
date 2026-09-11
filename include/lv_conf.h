@@ -36,7 +36,31 @@
 // 60 fps gives noticeably smoother animations / pan / scroll. Higher
 // values were chosen earlier when CPU was 80 MHz; on 160+ they're
 // leaving frame budget unused.
+//
+// E-PAPER OVERRIDE — and why it has to live HERE rather than in the env.
+//
+// This file is reached by every env via -D LV_CONF_PATH=lv_conf.h, and
+// lv_conf_internal.h includes it FIRST and only then applies its own #ifndef
+// defaults. Every setting in this file is a BARE #define, so a command-line
+// -D is *re*-defined by the file and loses — silently, because there is no
+// -Werror to turn the "macro redefined" warning into a failure. (The
+// `-D LV_INDEV_DEF_SCROLL_THROW=7` in every env block is a live example of
+// this going unnoticed; lv_hal_indev.h unconditionally redefines it to 10.)
+//
+// So a per-board LVGL cadence is a board-gated #if in this file, matching the
+// existing HAS_TANMATSU / HAS_TDISPLAY_P4 font block below. The #else branch
+// preserves the other eight boards byte-for-byte.
+//
+// 500 ms is LilyGo's own figure for this panel. It does NOT set the refresh
+// rate the user sees — the panel commit is throttled separately in
+// GDEQ031EpdDisplay::serviceRefresh(). What it does is stop LVGL rasterising
+// 60 frames a second that will never be shown, which on a board whose loop task
+// also runs the_mesh.loop() is wasted time the mesh wants back.
+#if defined(HAS_TDECK_PRO)
+#define LV_DISP_DEF_REFR_PERIOD 500
+#else
 #define LV_DISP_DEF_REFR_PERIOD 16
+#endif
 // 15 ms (was 30 ms): the touch driver runs async at 125 Hz so the cached state
 // is always fresh. Polling LVGL at 67 Hz catches brief taps that the previous
 // 30 ms cadence missed (felt as needing to click twice).
