@@ -252,7 +252,28 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
   #endif
 #endif
 
+#if CAP_SLOW_DISPLAY
+// A bistable panel cannot show four updates a second, so producing them only
+// burns CPU on a loop task that also runs the mesh. 2 s stays well inside the
+// refresh policy's own floor, so the panel cadence is still set by the policy.
+//
+// This is NOT what stops the screen changing when nothing happened -- that is
+// the byte-diff against the last-sent frame in TDeckProDisplay::serviceRefresh.
+// This just stops the firmware doing the render in the first place.
+constexpr unsigned long UI_REFRESH_MS = 2000;
+#else
 constexpr unsigned long UI_REFRESH_MS = 250;
+#endif
+// Overflowing-label behaviour. A marquee is an lv_anim with REPEAT_INFINITE: on
+// a panel that takes most of a second per update it is not a nicety, it is a
+// permanent source of dirty pixels that never lets the screen settle. One of
+// these is the always-visible status-bar title. Ellipsis instead.
+#if CAP_SLOW_DISPLAY
+  #define TOUCH_LABEL_LONG_OVERFLOW LV_LABEL_LONG_DOT
+#else
+  #define TOUCH_LABEL_LONG_OVERFLOW LV_LABEL_LONG_SCROLL_CIRCULAR
+#endif
+
 constexpr int UI_SORT_SCRATCH = UITask::MAX_UI_THREADS;
 UIEventType g_last_event = UIEventType::none;
 
@@ -34588,7 +34609,7 @@ static int append_settings_section(lv_obj_t* tab, int y, const char* title, lv_e
   lv_obj_align(tit, LV_ALIGN_TOP_LEFT, 14, 8);
 
   lv_obj_t* sub = lv_label_create(row);
-  lv_label_set_long_mode(sub, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_label_set_long_mode(sub, TOUCH_LABEL_LONG_OVERFLOW);
   lv_obj_set_width(sub, row_w - 48);
   lv_obj_set_height(sub, 18);
   lv_obj_set_style_text_font(sub, &g_font_12, LV_PART_MAIN);
@@ -38350,7 +38371,7 @@ static void refreshChatList(LvChatPanel& p) {
     // lv_list_add_btn creates: child[0]=icon label, child[1]=text label.
     lv_obj_t* text_lbl = lv_obj_get_child(btn, 1);
     if (text_lbl) {
-      lv_label_set_long_mode(text_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+      lv_label_set_long_mode(text_lbl, TOUCH_LABEL_LONG_OVERFLOW);
       // Leave room on the right for the gear + time + unread badge.
       lv_obj_set_width(text_lbl, lv_disp_get_hor_res(nullptr) - 116 - time_w - gear_w);
     }
@@ -38759,7 +38780,7 @@ static bool ctRefreshRowsInPlace() {
           lv_point_t nsz;
           lv_txt_get_size(&nsz, san, &g_font_14, 0, 0, s_ct_name_w, LV_TEXT_FLAG_NONE);
           const int name_line_h = lv_font_get_line_height(&g_font_14);
-          lv_label_set_long_mode(nm, (nsz.y > 2 * name_line_h) ? LV_LABEL_LONG_SCROLL_CIRCULAR
+          lv_label_set_long_mode(nm, (nsz.y > 2 * name_line_h) ? TOUCH_LABEL_LONG_OVERFLOW
                                                                : LV_LABEL_LONG_DOT);
         }
         lv_label_set_text(nm, san);
@@ -39092,7 +39113,7 @@ static void refreshContactsList() {
       lv_point_t nsz;
       lv_txt_get_size(&nsz, san, &g_font_14, 0, 0, name_w, LV_TEXT_FLAG_NONE);
       const int name_line_h = lv_font_get_line_height(&g_font_14);
-      lv_label_set_long_mode(nm, (nsz.y > 2 * name_line_h) ? LV_LABEL_LONG_SCROLL_CIRCULAR
+      lv_label_set_long_mode(nm, (nsz.y > 2 * name_line_h) ? TOUCH_LABEL_LONG_OVERFLOW
                                                            : LV_LABEL_LONG_DOT);
       lv_obj_set_width(nm, name_w);
     }
@@ -47167,7 +47188,7 @@ static void updateGlobalStatusBar() {
         lv_obj_set_width(g_statusbar.left_label,
                          (sb_w >= 600) ? (sb_w - SC(190)) : (sb_w >= 300) ? 100 : 66);   // #47a: narrower window on the 240px V4 bar so a long name can't run into the clock
 #endif
-        lv_label_set_long_mode(g_statusbar.left_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_label_set_long_mode(g_statusbar.left_label, TOUCH_LABEL_LONG_OVERFLOW);
         lv_obj_set_style_anim_speed(g_statusbar.left_label, 14, LV_PART_MAIN);  // slow, readable marquee
         lv_label_set_text(g_statusbar.left_label, nm);
       }
@@ -47644,7 +47665,18 @@ static void refreshStatusLabels() {
   const bool home_active = (active_tab == HOME_TAB_INDEX);
   if (home_active) refreshHomeBattery();
   // Push a TX/RX sample onto the home chart: delta packets since last tick.
-  if (home_active && s_home_chart && s_home_chart_tx && s_home_chart_rx) {
+  #if CAP_SLOW_DISPLAY
+  // A chart point is a guaranteed pixel change, so on e-paper each one costs a
+  // panel update no byte-diff can skip. Floor it at 5 s; the packet delta keeps
+  // accumulating across skipped ticks rather than being dropped, so the series
+  // still totals correctly -- it is coarser, not wrong.
+  static uint32_t s_chart_next_ms = 0;
+  bool chart_due = (int32_t)(millis() - s_chart_next_ms) >= 0;
+  if (chart_due) s_chart_next_ms = millis() + 5000;
+#else
+  const bool chart_due = true;
+#endif
+  if (chart_due && home_active && s_home_chart && s_home_chart_tx && s_home_chart_rx) {
     static uint32_t last_tx = 0;
     static uint32_t last_rx = 0;
     uint32_t cur_tx = the_mesh.getNumSentFlood() + the_mesh.getNumSentDirect();
@@ -55955,7 +55987,23 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       g_lv.indev_drv.type    = LV_INDEV_TYPE_POINTER;
       g_lv.indev_drv.read_cb = lvglTouchRead;
       g_lv.indev_drv.disp    = lv_disp_get_default();
-      if (!lv_indev_drv_register(&g_lv.indev_drv)) pushDiagLine("LVGL indev failed");
+      lv_indev_t* touch_indev = lv_indev_drv_register(&g_lv.indev_drv);
+      if (!touch_indev) pushDiagLine("LVGL indev failed");
+#if CAP_SLOW_DISPLAY
+      // Kill flick momentum. Written to the REGISTERED driver, not to the
+      // pre-register struct and not from a theme apply_cb: lv_hal_indev.c copies
+      // its own LV_INDEV_DEF_SCROLL_THROW over whatever was set beforehand, and
+      // lv_obj_constructor re-ORs SCROLL_MOMENTUM after lv_theme_apply runs.
+      // Post-register assignment is the one place that sticks.
+      //
+      // On e-paper momentum is actively harmful: the list keeps moving after the
+      // finger lifts, so the frame that finally gets committed is not the one
+      // the user aimed at. Zero throw makes a drag land where it was released.
+      if (touch_indev) {
+        touch_indev->driver->scroll_throw = 0;
+        touch_indev->driver->scroll_limit = 12;
+      }
+#endif
     }
 #endif
 

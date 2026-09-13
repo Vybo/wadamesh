@@ -180,6 +180,21 @@
   #define CAP_UI_SIZE 0
 #endif
 
+// A display slow enough that producing frames faster than it can show them is
+// pure waste, and where anything that moves by itself never lets the screen
+// settle. Today only the T-Deck Pro's e-paper, but this is deliberately a
+// PROPERTY rather than a board name: a future reflective-LCD or shared-bus
+// panel would want the same cadence rules without being a T-Deck Pro.
+//
+// Only the cadence sites gate on this. The Pro's monochrome UI treatment stays
+// on `defined(HAS_TDECK_PRO)` like the rest of that work -- introducing a second
+// vocabulary for the same board would make both harder to follow.
+#if defined(HAS_TDECK_PRO)
+  #define CAP_SLOW_DISPLAY 1
+#else
+  #define CAP_SLOW_DISPLAY 0
+#endif
+
 // ---- Derived input capabilities ---------------------------------------------
 // Physical keyboard: T-Deck matrix, Tanmatsu keypad, the pager's TCA8418, or
 // the ThinkNode M9 keyboard.

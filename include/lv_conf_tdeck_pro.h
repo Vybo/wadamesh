@@ -19,3 +19,20 @@
 #ifdef LV_INDEV_DEF_SCROLL_THROW
 #undef LV_INDEV_DEF_SCROLL_THROW
 #endif
+
+// The stock theme animates bg-colour/opacity over 80 ms on press and release of
+// every button. On a bistable panel that is two extra panel updates per tap,
+// showing a fade one bit cannot represent anyway.
+#ifdef LV_THEME_DEFAULT_TRANSITION_TIME
+#undef LV_THEME_DEFAULT_TRANSITION_TIME
+#endif
+#define LV_THEME_DEFAULT_TRANSITION_TIME 0
+
+// Stop LVGL rasterising frames that will never be shown. This does NOT set the
+// rate the user sees -- the panel commit is throttled separately by the refresh
+// policy in TDeckProDisplay -- it just stops the render work on a loop task that
+// also runs the mesh. 500 ms is LilyGo's own figure for this panel.
+#ifdef LV_DISP_DEF_REFR_PERIOD
+#undef LV_DISP_DEF_REFR_PERIOD
+#endif
+#define LV_DISP_DEF_REFR_PERIOD 500
