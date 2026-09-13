@@ -27,6 +27,14 @@
   #define EPD_FRONTLIGHT_PWM_CH 2   // 0/1 are taken by the keyboard backlight path
 #endif
 
+// 2 MHz. GxEPD2 would default to 4; LilyGo's own factory firmware and the
+// camillia-mt port both drive this panel at 2, and for a bus that is also
+// carrying the radio and the SD card during bring-up, the slower, known-good
+// figure is the right starting point.
+#ifndef EPD_SPI_HZ
+  #define EPD_SPI_HZ 2000000
+#endif
+
 // The panel is on the bus shared with the SX1262 and the microSD, so every
 // other CS is parked high before an update. There is no bus mutex anywhere in
 // this firmware — the invariant is "everything runs sequentially on the loop
@@ -120,10 +128,31 @@ bool GDEQ031EpdDisplay::begin() {
   memset(_sent, 0xFF, kMonoBytes);
   _have_sent = false;
 
-  // The SPI bus is already begun for the radio (variants/.../target.cpp). Hand
-  // GxEPD2 the same instance rather than letting it call SPI.begin() a second
-  // time with its own pin set.
-  _impl->epd.init(115200, true, 2, false);
+  // Hand GxEPD2 the SHARED bus, with pins, BEFORE init().
+  //
+  // This is not optional and its absence is silent. GxEPD2_EPD defaults to
+  // `_pSPIx(&SPI)` -- the global Arduino instance -- and its init() calls
+  // `_pSPIx->begin()` with NO pin arguments. On an ESP32-S3 that attaches no
+  // pins at all for a non-FSPI host, so every command clocks out into nothing
+  // and the panel simply never draws. There is no error anywhere.
+  //
+  // The radio's own SPIClass (variants/.../target.cpp) is the bus the panel,
+  // the SX1262 and the microSD all share, but display.begin() runs at
+  // main.cpp:858, BEFORE radio_init() at :903 -- so it is not begun yet and
+  // this has to do it. SPIClass::begin() returns early when already
+  // initialised, so the radio's later std_init(&spi) inherits these pins
+  // instead of fighting them; they are the same pins either way.
+  extern SPIClass* tdeckSharedSPI();
+  SPIClass* bus = tdeckSharedSPI();
+  if (!bus) return false;
+  bus->begin(P_LORA_SCLK, P_LORA_MISO, P_LORA_MOSI, -1);   // CS driven per-device, not by the bus
+  _impl->epd.epd2.selectSPI(*bus, SPISettings(EPD_SPI_HZ, MSBFIRST, SPI_MODE0));
+
+  // serial_diag_bitrate MUST be 0. Any non-zero value makes GxEPD2 call
+  // Serial.begin() itself -- and on this firmware the UART belongs to the
+  // companion protocol, so that would corrupt the phone/app link to gain
+  // diagnostics nobody can read anyway.
+  _impl->epd.init(0, true, 2, false);
   _impl->epd.epd2.setBusyCallback(&GDEQ031EpdDisplay::busyCallback);
   _impl->epd.setRotation(0);               // native portrait; no MADCTL on this panel
   _impl->epd.setTextWrap(false);
@@ -204,10 +233,10 @@ void GDEQ031EpdDisplay::startFrame(ColorVal bkg) {
   // splash passes an explicit black because an LCD's window_bkg is black; on
   // e-paper that would be a near-solid-ink screen, slow and ghost-prone.
   (void)bkg;
-  _impl->epd.setFullWindow();
+  _lvgl_active = false;          // hands the panel to the text path until the next LVGL flush
+  _impl->epd.setFullWindow();    // window selection belongs HERE, before firstPage()
   _impl->epd.firstPage();
   _impl->epd.fillScreen(GxEPD_WHITE);
-  _lvgl_active = false;
   _dirty = true;
 }
 
@@ -250,7 +279,26 @@ uint16_t GDEQ031EpdDisplay::getTextWidth(const char* str) {
 void GDEQ031EpdDisplay::endFrame() {
   // On an LCD this is a no-op. Here it is the whole point: it is the only
   // signal that a non-LVGL frame is complete and may be shown.
-  requestRefresh(false);
+  //
+  // The text path commits SYNCHRONOUSLY, right here, rather than handing the
+  // frame to serviceRefresh(). Two reasons:
+  //
+  //  * Correctness. startFrame() already called setFullWindow() + firstPage(),
+  //    and GxEPD2's paging is a strict sequence -- selecting a window again
+  //    between firstPage() and nextPage(), which is what deferring to
+  //    serviceRefresh() did, corrupts it and nothing is drawn.
+  //  * It is the right behaviour anyway. This path is the boot splash (before
+  //    LVGL exists, so no loop is running to service anything) and the
+  //    remote-mode placeholder (a one-off mode switch). Blocking ~1 s there is
+  //    expected; it is also the first proof of life the panel can give.
+  if (!_impl || _lvgl_active) return;
+  while (_impl->epd.nextPage()) { }
+  _impl->epd.powerOff();
+  _have_sent      = false;   // the glass no longer matches _sent
+  _dirty          = false;
+  _last_commit_at = millis();
+  _partial_count  = 0;       // a full window was just pushed
+  _force_full     = false;
 }
 
 void GDEQ031EpdDisplay::clear() {
@@ -318,14 +366,16 @@ bool GDEQ031EpdDisplay::serviceRefresh(bool force) {
   const bool full = _force_full
                  || (_full_every_n != 0 && _partial_count >= _full_every_n);
 
-  if (_lvgl_active) {
-    // Nothing changed since the last push: skip the whole 0.7-1.1 s update.
-    // This is what keeps an idle device from flashing — it is the backstop for
-    // every redraw the UI issues without actually changing a pixel.
-    if (!full && _have_sent && memcmp(_mono, _sent, kMonoBytes) == 0) {
-      _dirty = false;
-      return false;
-    }
+  // The text path commits itself in endFrame() (see the note there), so by the
+  // time anything reaches here the frame is always the LVGL shadow.
+  if (!_lvgl_active) { _dirty = false; return false; }
+
+  // Nothing changed since the last push: skip the whole 0.7-1.1 s update.
+  // This is what keeps an idle device from flashing — it is the backstop for
+  // every redraw the UI issues without actually changing a pixel.
+  if (!full && _have_sent && memcmp(_mono, _sent, kMonoBytes) == 0) {
+    _dirty = false;
+    return false;
   }
 
   digitalWrite(P_LORA_NSS, HIGH);
@@ -335,22 +385,15 @@ bool GDEQ031EpdDisplay::serviceRefresh(bool force) {
   if (full) _impl->epd.setFullWindow();
   else      _impl->epd.setPartialWindow(0, 0, PANEL_WIDTH, PANEL_HEIGHT);
 
-  if (_lvgl_active) {
-    // drawInvertedBitmap: a SET bit renders as the background (paper), a CLEAR
-    // bit as GxEPD_BLACK. That matches the convention _mono is packed in.
-    _impl->epd.firstPage();
-    do {
-      _impl->epd.fillScreen(GxEPD_WHITE);
-      _impl->epd.drawInvertedBitmap(0, 0, _mono, PANEL_WIDTH, PANEL_HEIGHT, GxEPD_BLACK);
-    } while (_impl->epd.nextPage());
-    memcpy(_sent, _mono, kMonoBytes);
-    _have_sent = true;
-  } else {
-    // The text path already drew into GxEPD2's framebuffer between
-    // startFrame() and endFrame(); just page it out.
-    while (_impl->epd.nextPage()) { }
-    _have_sent = false;                 // _sent no longer describes the glass
-  }
+  // drawInvertedBitmap: a SET bit renders as the background (paper), a CLEAR
+  // bit as GxEPD_BLACK. That matches the convention _mono is packed in.
+  _impl->epd.firstPage();
+  do {
+    _impl->epd.fillScreen(GxEPD_WHITE);
+    _impl->epd.drawInvertedBitmap(0, 0, _mono, PANEL_WIDTH, PANEL_HEIGHT, GxEPD_BLACK);
+  } while (_impl->epd.nextPage());
+  memcpy(_sent, _mono, kMonoBytes);
+  _have_sent = true;
   _impl->epd.powerOff();
 
   _last_refresh_ms = millis() - started;
