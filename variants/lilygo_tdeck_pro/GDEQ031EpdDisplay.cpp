@@ -59,11 +59,16 @@ static void (*s_busy_hook)() = nullptr;
 // diff. An ordered matrix is a pure function of (x, y), so identical content
 // packs to identical bytes and the no-change skip in serviceRefresh() keeps
 // working.
+// Thresholds are (M + 0.5) / 16 * 255 for Bayer index M, i.e. M*16 + 8, giving
+// the range 8..248. The +8 offset is not cosmetic: with the naive M*16 + 15 the
+// top cell is 255, and the ink test (luma <= threshold) then inks one cell in
+// sixteen for PURE WHITE -- a visible dot grid over every white background on
+// the panel. Pure black must still ink all sixteen, which 0 <= 8 satisfies.
 static const uint8_t kBayer4[4][4] = {
-  {  15, 143,  47, 175 },
-  { 207,  79, 239, 111 },
-  {  63, 191,  31, 159 },
-  { 255, 127, 223,  95 },
+  {   8, 136,  40, 168 },
+  { 200,  72, 232, 104 },
+  {  56, 184,  24, 152 },
+  { 248, 120, 216,  88 },
 };
 
 // Rec.601 luma from RGB565, without leaving integer maths. The 5/6/5 channels

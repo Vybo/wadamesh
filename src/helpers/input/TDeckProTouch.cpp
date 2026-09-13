@@ -9,17 +9,30 @@
 // TWO CONTROLLERS, ONE ADDRESS
 // ----------------------------
 // Units ship with either a CST328 or a CST3530 and BOTH answer at 0x1A with
-// incompatible register protocols. Worse, the CST3530 self-sleeps, so it cannot
-// be polled at all — it has to be read on its INT edge. This file probes for
-// the CST3530 first (its 0xD0-family command set has a positive identity reply)
-// and falls back to the CST328's plain register map.
+// incompatible register protocols. The CST3530 additionally self-sleeps, so it
+// cannot be polled blind -- it has to be read on its INT edge.
 //
-// The CST3530 half is implemented against the protocol as published by the
-// camillia-mt project, which reverse-engineered it; it is UNVERIFIED against
-// hardware here. If touch is dead on a unit, heltecV4CapTouchDebug() reports
-// which controller was detected — that string is surfaced in the on-screen diag
-// panel, which is the only diagnostic channel this build has (Serial belongs to
-// the companion protocol).
+// DETECTION ORDER MATTERS, and getting it backwards is silent. The first cut of
+// this file probed for the CST3530 by writing 0xD0 0x03 and testing for a 0xCACA
+// reply -- but 0xCACA is the CST328's OWN debug-mode chip ID (see
+// CSE_CST328: enter 0xD101, read the info register, check (id >> 16) == 0xCACA).
+// So a perfectly healthy CST328 identified as a CST3530 and was then driven with
+// the wrong protocol, and touch did nothing at all.
+//
+// The CST328 is therefore tried FIRST, by its documented mode sequence, and the
+// CST3530 is the fallback. No chip-ID read is used: a successful mode-register
+// write is the presence test, which avoids depending on an info-register address
+// the published constants do not actually name.
+//
+// The CST328 register map follows CIRCUITSTATE's CSE_CST328 (the driver the
+// camillia-mt T-Deck Pro port uses): 16-bit register addresses, finger 1 block
+// at 0xD000, state in the low nibble of byte 0, and the 12-bit X/Y split across
+// bytes 1-3. The CST3530 half is camillia-mt's reverse-engineering and remains
+// UNVERIFIED.
+//
+// heltecV4CapTouchDebug() reports which controller was selected AND the last raw
+// sample, and is surfaced in the on-screen diag panel -- the only diagnostic
+// channel this build has (Serial belongs to the companion protocol).
 #if defined(HAS_TDECK_PRO) && defined(ESP32)
 
 #include <Arduino.h>
@@ -54,6 +67,7 @@ static bool     s_is_3530   = false;
 static char     s_diag[96]  = "touch: (not run)";
 
 static volatile uint16_t s_dbg_rawx = 0, s_dbg_rawy = 0;
+static volatile uint8_t  s_dbg_state = 0;   // last byte 0 of the finger-1 block
 static volatile bool     s_irq_fired = false;
 
 static bool     s_down = false;
@@ -157,19 +171,37 @@ static bool cst328ReadReg(uint16_t reg, uint8_t* buf, uint8_t len) {
   return true;
 }
 
+// Bare 16-bit register address with no payload -- this chip's mode registers are
+// selected by addressing them, not by writing a value to them.
+static bool cst328Write16(uint16_t reg) {
+  Wire.beginTransmission((uint8_t)TDECK_PRO_TOUCH_ADDR);
+  Wire.write((uint8_t)(reg >> 8));
+  Wire.write((uint8_t)(reg & 0xFF));
+  return Wire.endTransmission(true) == 0;
+}
+
+// Debug-info mode, then straight back to normal. The round trip is what arms the
+// controller to report; without it the data registers read as zeros forever.
+static bool cst328Init() {
+  if (!cst328Write16(0xD101)) return false;   // REG_MODE_DEBUG_INFO
+  delay(10);
+  if (!cst328Write16(0xD109)) return false;   // REG_MODE_NORMAL
+  delay(10);
+  return true;
+}
+
+// Finger 1 block at 0xD000. Byte 0 low nibble is the touch state (6 == down),
+// and X/Y are 12-bit values split across bytes 1-3. Note there is a two-byte gap
+// at 0xD005/0xD006 before finger 2, which is why a finger count cannot simply be
+// read from 0xD005 -- the first cut of this file did exactly that and treated the
+// gap as a count.
 static bool cst328Read(uint16_t* x, uint16_t* y) {
-  uint8_t n = 0;
-  if (!cst328ReadReg(0xD005, &n, 1)) return false;   // finger count
-  n &= 0x0F;
-  if (n == 0 || n > 5) return false;
   uint8_t d[5] = {};
   if (!cst328ReadReg(0xD000, d, sizeof d)) return false;
-  *x = (uint16_t)(((uint16_t)d[1] << 4) | ((d[3] & 0xF0) >> 4));
+  s_dbg_state = d[0];
+  if ((d[0] & 0x0F) != 6) return false;       // no finger down
+  *x = (uint16_t)(((uint16_t)d[1] << 4) | ((d[3] >> 4) & 0x0F));
   *y = (uint16_t)(((uint16_t)d[2] << 4) |  (d[3] & 0x0F));
-  uint8_t clear = 0x00;                               // release the report
-  Wire.beginTransmission((uint8_t)TDECK_PRO_TOUCH_ADDR);
-  Wire.write(0xD0); Wire.write(0x05); Wire.write(clear);
-  (void)Wire.endTransmission();
   return true;
 }
 
@@ -191,8 +223,9 @@ static void touchPoll() {
   }
 
   if (pressed) {
+    s_dbg_rawx = rx;                 // stamped BEFORE the range test on purpose:
+    s_dbg_rawy = ry;                 // a swapped axis must be visible, not dropped
     if (rx >= SCR_W || ry >= SCR_H) pressed = false;
-    else { s_dbg_rawx = rx; s_dbg_rawy = ry; }
   }
 
   if (pressed) {
@@ -259,22 +292,21 @@ bool heltecV4CapTouchBegin() {
   digitalWrite(PIN_TOUCH_RST, LOW);  delay(80);
   digitalWrite(PIN_TOUCH_RST, HIGH); delay(20);
 
-  s_is_3530 = cst3530Probe();
-  if (s_is_3530) {
-    pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
-    s_init_ok = cst3530Init();
-    if (s_init_ok) {
-      s_irq_fired = false;
-      attachInterrupt(digitalPinToInterrupt(PIN_TOUCH_INT), touchIsr, FALLING);
+  // CST328 first -- see the header note on why the old 0xCACA probe mis-sorted
+  // a healthy CST328 into the CST3530 path.
+  s_is_3530 = false;
+  s_init_ok = cst328Init();
+  if (!s_init_ok) {
+    s_is_3530 = cst3530Probe();
+    if (s_is_3530) {
+      pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
+      s_init_ok = cst3530Init();
+      if (s_init_ok) {
+        s_irq_fired = false;
+        attachInterrupt(digitalPinToInterrupt(PIN_TOUCH_INT), touchIsr, FALLING);
+      }
     }
-  } else {
-    uint8_t probe = 0;
-    s_init_ok = cst328ReadReg(0xD005, &probe, 1);
   }
-
-  snprintf(s_diag, sizeof s_diag, "touch: %s @0x%02X %s",
-           s_is_3530 ? "CST3530" : "CST328", (unsigned)TDECK_PRO_TOUCH_ADDR,
-           s_init_ok ? "ok" : "MISSING");
   return s_init_ok;
 }
 
@@ -324,7 +356,18 @@ bool heltecV4CapTouchIsSwiping()      { return s_swiping_now; }
 void heltecV4CapTouchSetRotation(uint8_t r)      { s_ui_rotation = r; }
 void heltecV4CapTouchSetPointRotation(uint8_t r) { s_point_rotation = r; }
 void heltecV4CapTouchSetSlowPoll(bool slow)      { s_slow_poll = slow; }
-const char* heltecV4CapTouchDebug()              { return s_diag; }
+// Regenerated on every call rather than stamped once at boot: the live diag
+// overlay polls this at 4 Hz, and on a board with no readable Serial the raw
+// sample IS the instrument. `st` is byte 0 of the finger-1 block (low nibble 6
+// means finger down); raw x,y are reported BEFORE the on-screen bounds check, so
+// a swapped or out-of-range axis is visible rather than silently dropped.
+const char* heltecV4CapTouchDebug() {
+  snprintf(s_diag, sizeof s_diag, "%s@0x%02X %s st=%02X raw=%u,%u",
+           s_is_3530 ? "CST3530" : "CST328", (unsigned)TDECK_PRO_TOUCH_ADDR,
+           s_init_ok ? "ok" : "MISSING", (unsigned)s_dbg_state,
+           (unsigned)s_dbg_rawx, (unsigned)s_dbg_rawy);
+  return s_diag;
+}
 
 void heltecV4CapTouchGetRaw(uint16_t* rx, uint16_t* ry) {
   if (rx) *rx = s_dbg_rawx;
