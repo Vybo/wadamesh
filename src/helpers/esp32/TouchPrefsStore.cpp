@@ -147,6 +147,13 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.attaky_notify_enabled    = 0;  // OFF: incoming messages do not blink the keyboard indicators
   c.attaky_notify_room_color = 0;  // red
   c.attaky_notify_dm_color   = 1;  // green
+  // v59 e-paper refresh policy. These reproduce the constants they replaced
+  // in TDeckProDisplay, so an existing Pro behaves identically until the
+  // user changes something. Inert on every other board.
+  c.epd_min_refresh_ms = 250;
+  c.epd_full_every_n   = 9;
+  c.epd_full_on_screen = 1;   // a page switch changes everything; partial-updating it smears
+  c.epd_full_on_wake   = 1;   // clear whatever ghosting accrued while the panel sat idle
   c.compact_chat      = 0;      // OFF: bubble chat layout (opt-in IRC-style dense rows)
   c.clock_floor       = 0;      // no persisted send-timestamp floor yet
   c.rx_queue          = 1;      // ON: buffered receive (test-channel default; opt-out toggle in Radio & Mesh)
@@ -266,6 +273,16 @@ static void cfgLoadOrMigrate() {
           s_cfg.attaky_notify_enabled = 0;
           s_cfg.attaky_notify_room_color = 0;
           s_cfg.attaky_notify_dm_color = 1;
+        }
+        // v59: four new trailing fields. Force them to the SAME values
+        // cfgSetDefaults uses -- an inherited garbage byte here would be a
+        // nonsense policy (a 0 ms interval asks for a refresh every frame) on a
+        // panel that physically cannot sustain it.
+        if (stored_version < 59) {
+          s_cfg.epd_min_refresh_ms = 250;
+          s_cfg.epd_full_every_n   = 9;
+          s_cfg.epd_full_on_screen = 1;
+          s_cfg.epd_full_on_wake   = 1;
         }
         if (stored_version < 31) s_cfg.compact_chat = 0;  // new trailing field: compact chat rows off by default
         if (stored_version < 32) s_cfg.clock_floor = 0;   // new trailing field: no send-timestamp floor persisted yet (#89)
@@ -1221,6 +1238,63 @@ uint16_t touchPrefsGetGpsFuzzM() {
 bool touchPrefsSetGpsFuzzM(uint16_t m) {
   if (!s_begun) touchPrefsBegin();
   s_cfg.gps_fuzz_m = m;
+  return cfgFlush();
+}
+
+// ---- v59 e-paper refresh policy ----------------------------------------
+// Clamped on both read and write: a corrupt stored byte must not be able to ask
+// a bistable panel for a rate it cannot physically sustain.
+static const uint16_t EPD_MIN_REFRESH_MS_MIN = 200;    // below the panel's own partial-update time
+static const uint16_t EPD_MIN_REFRESH_MS_MAX = 30000;  // 30 s -- effectively "only on demand"
+static const uint8_t  EPD_FULL_EVERY_MAX     = 60;
+
+uint16_t touchPrefsGetEpdMinRefreshMs() {
+  if (!s_begun) touchPrefsBegin();
+  uint16_t ms = s_cfg.epd_min_refresh_ms;
+  if (ms < EPD_MIN_REFRESH_MS_MIN) ms = EPD_MIN_REFRESH_MS_MIN;
+  if (ms > EPD_MIN_REFRESH_MS_MAX) ms = EPD_MIN_REFRESH_MS_MAX;
+  return ms;
+}
+bool touchPrefsSetEpdMinRefreshMs(uint16_t ms) {
+  if (ms < EPD_MIN_REFRESH_MS_MIN) ms = EPD_MIN_REFRESH_MS_MIN;
+  if (ms > EPD_MIN_REFRESH_MS_MAX) ms = EPD_MIN_REFRESH_MS_MAX;
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_min_refresh_ms = ms;
+  return cfgFlush();
+}
+
+// 0 is a LEGITIMATE stored value -- "never de-ghost automatically", which is what
+// someone leaving the device on a static screen wants. Only the ceiling clamps.
+uint8_t touchPrefsGetEpdFullEveryN() {
+  if (!s_begun) touchPrefsBegin();
+  uint8_t n = s_cfg.epd_full_every_n;
+  if (n > EPD_FULL_EVERY_MAX) n = EPD_FULL_EVERY_MAX;
+  return n;
+}
+bool touchPrefsSetEpdFullEveryN(uint8_t n) {
+  if (n > EPD_FULL_EVERY_MAX) n = EPD_FULL_EVERY_MAX;
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_full_every_n = n;
+  return cfgFlush();
+}
+
+bool touchPrefsGetEpdFullOnScreen() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.epd_full_on_screen != 0;
+}
+bool touchPrefsSetEpdFullOnScreen(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_full_on_screen = on ? 1 : 0;
+  return cfgFlush();
+}
+
+bool touchPrefsGetEpdFullOnWake() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.epd_full_on_wake != 0;
+}
+bool touchPrefsSetEpdFullOnWake(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_full_on_wake = on ? 1 : 0;
   return cfgFlush();
 }
 

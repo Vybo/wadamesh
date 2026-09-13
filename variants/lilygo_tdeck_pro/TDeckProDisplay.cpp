@@ -189,6 +189,11 @@ void TDeckProDisplay::writeBrightness(uint8_t brightness) {
   ledcWrite(TDECK_PRO_FRONTLIGHT_CHANNEL, brightness);
 }
 
+void TDeckProDisplay::setRefreshPolicy(uint16_t min_interval_ms, uint8_t full_every_n) {
+  _min_interval_ms = min_interval_ms;
+  _full_every_n = full_every_n;
+}
+
 void TDeckProDisplay::requestRefresh(bool full) {
   _refresh_pending = true;
   _full_refresh_pending = _full_refresh_pending || full;
@@ -197,9 +202,10 @@ void TDeckProDisplay::requestRefresh(bool full) {
 void TDeckProDisplay::serviceRefresh(bool force) {
   if (!_refresh_pending || _sleeping || !_mono) return;
   const uint32_t now = millis();
-  if (!force && _last_refresh_ms && now - _last_refresh_ms < 250) return;
+  if (!force && _last_refresh_ms && now - _last_refresh_ms < _min_interval_ms) return;
 
-  const bool full = _full_refresh_pending || _partial_refreshes >= 9;
+  const bool full = _full_refresh_pending ||
+                    (_full_every_n != 0 && _partial_refreshes >= _full_every_n);
   if (!full && _sent_valid && memcmp(_mono, _sent, MONO_BYTES) == 0) {
     _refresh_pending = false;
     return;

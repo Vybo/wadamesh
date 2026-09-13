@@ -9,7 +9,7 @@
 namespace TouchPrefsSchema {
 
 static constexpr uint16_t MAGIC = 0x5743;   // 'WC' (WadaCfg)
-static constexpr uint8_t CURRENT_VERSION = 58;   // v49: fem_lna default flip on the V4-R8; v50: map tile z/x/y line off by default (no new fields); v51: console_mode (boot into the text console; new trailing field, default OFF); v52: console_monitor (show incoming messages in the console, default ON); v54: boot_wifi_time + boot_wifi_open (cold-boot saved-Wi-Fi time sync, #383; both OFF); v55: loud_alerts (resonant-pitch chime, #388; OFF); v56: theme_mode (Day/Night firmware theme, #296; default Night); v57: gps_fuzz_m (displace the advertised position, #399; 0 = off); v58: Attaky notification blink enable + room/DM color indexes (#423)
+static constexpr uint8_t CURRENT_VERSION = 59;   // v49: fem_lna default flip on the V4-R8; v50: map tile z/x/y line off by default (no new fields); v51: console_mode (boot into the text console; new trailing field, default OFF); v52: console_monitor (show incoming messages in the console, default ON); v54: boot_wifi_time + boot_wifi_open (cold-boot saved-Wi-Fi time sync, #383; both OFF); v55: loud_alerts (resonant-pitch chime, #388; OFF); v56: theme_mode (Day/Night firmware theme, #296; default Night); v57: gps_fuzz_m (displace the advertised position, #399; 0 = off); v58: Attaky notification blink enable + room/DM color indexes (#423); v59: epd_* e-paper refresh policy (T-Deck Pro; four trailing fields, inert on every other board)
 static constexpr uint8_t BROKEN_MID_INSERT_VERSION = 44;
 
 // Persisted byte layout. New fields must be appended at the end: older blobs
@@ -112,6 +112,19 @@ struct __attribute__((packed)) Config {
   uint8_t  attaky_notify_enabled;    // v58: blink both keyboard indicators for incoming messages
   uint8_t  attaky_notify_room_color; // v58: seven-color palette index for rooms/channels
   uint8_t  attaky_notify_dm_color;   // v58: seven-color palette index for direct messages
+  // v59 -- e-paper refresh policy (T-Deck Pro). Stored on every board so the
+  // persisted layout stays board-independent; only the Pro reads them.
+  //
+  // A bistable panel makes refreshing a user-visible cost rather than a free
+  // side effect: each update takes most of a second and visibly changes the
+  // screen, and partial updates accumulate ghosting that only a full de-ghost
+  // cycle clears. Both halves are a trade-off someone might reasonably want to
+  // set differently -- static reading versus a live chart -- which is why these
+  // are preferences and not the constants they replaced.
+  uint16_t epd_min_refresh_ms;   // floor between panel commits; higher = calmer, staler
+  uint8_t  epd_full_every_n;     // de-ghost after N partials; 0 = never automatically
+  uint8_t  epd_full_on_screen;   // de-ghost when the whole screen changes (tab/page switch)
+  uint8_t  epd_full_on_wake;     // de-ghost on wake, clearing ghosting accrued while asleep
 };
 
 static constexpr size_t HEADER_SIZE = offsetof(Config, bright);
@@ -127,8 +140,20 @@ static_assert(offsetof(Config, web_mirror) == offsetof(Config, rx_queue) + sizeo
 // whichever board is using the file backend. 117 bytes today.
 static_assert(sizeof(Config) <= 2048,
               "Config exceeds the SdNvsPrefs value cap; prefs would silently stop saving");
-static_assert(offsetof(Config, attaky_notify_dm_color) + sizeof(Config::attaky_notify_dm_color) == sizeof(Config),
+static_assert(offsetof(Config, epd_full_on_wake) + sizeof(Config::epd_full_on_wake) == sizeof(Config),
               "new preference fields must remain trailing");
+static_assert(offsetof(Config, epd_min_refresh_ms) ==
+                  offsetof(Config, attaky_notify_dm_color) + sizeof(Config::attaky_notify_dm_color),
+              "epd_min_refresh_ms must follow attaky_notify_dm_color");
+static_assert(offsetof(Config, epd_full_every_n) ==
+                  offsetof(Config, epd_min_refresh_ms) + sizeof(Config::epd_min_refresh_ms),
+              "epd_full_every_n must follow epd_min_refresh_ms");
+static_assert(offsetof(Config, epd_full_on_screen) ==
+                  offsetof(Config, epd_full_every_n) + sizeof(Config::epd_full_every_n),
+              "epd_full_on_screen must follow epd_full_every_n");
+static_assert(offsetof(Config, epd_full_on_wake) ==
+                  offsetof(Config, epd_full_on_screen) + sizeof(Config::epd_full_on_screen),
+              "epd_full_on_wake must follow epd_full_on_screen");
 // lang_file must stay immediately before the tail, or a v48-era blob overlays
 // onto the wrong bytes. Checking both ends means the next person to append is
 // told at compile time instead of shipping another v44.

@@ -9280,6 +9280,13 @@ static void updateTabIndicator() {
 
 static void tabChangedCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+#if defined(HAS_TDECK_PRO)
+  // A tab switch changes essentially every pixel, which is the worst case for a
+  // partial update -- the old page stays faintly visible underneath. De-ghost
+  // instead, if the user wants it. The commit still goes through the normal
+  // coalescing path.
+  if (touchPrefsGetEpdFullOnScreen()) display.requestFullRefresh();
+#endif
   scheduleHeavyRefresh(170);
   closeSettingsModal();
   closeSettingsCategory();   // a category detail sheet floats on layer_top — drop it on tab change
@@ -13022,6 +13029,56 @@ static void msgFlashToggleCb(lv_event_t* e) {
 
 // 12-hour vs 24-hour clock. Applies on the next time render (status bar, chat
 // rows, message bubbles).
+#if defined(HAS_TDECK_PRO)
+// ---- E-paper refresh policy (Settings -> Display) --------------------------
+// Dropdowns rather than sliders on purpose: on a bistable panel every drag step
+// of a slider is its own panel commit, so a slider is actively unpleasant to
+// operate. A short list of discrete values is one commit per choice.
+static const uint16_t k_epd_interval_opts[] = { 200, 250, 500, 1000, 2000, 5000, 10000 };
+static const uint8_t  k_epd_full_every_opts[] = { 0, 3, 5, 9, 20, 40 };
+
+static void epdApplyPolicy() {
+  display.setRefreshPolicy(touchPrefsGetEpdMinRefreshMs(), touchPrefsGetEpdFullEveryN());
+}
+
+static void epdMinRefreshSelectCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const uint16_t i = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (i >= (sizeof(k_epd_interval_opts) / sizeof(k_epd_interval_opts[0]))) return;
+  touchPrefsSetEpdMinRefreshMs(k_epd_interval_opts[i]);
+  epdApplyPolicy();
+  if (g_lv.task) g_lv.task->showAlert(TR("Refresh interval saved"), 900);
+}
+
+static void epdFullEverySelectCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const uint16_t i = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (i >= (sizeof(k_epd_full_every_opts) / sizeof(k_epd_full_every_opts[0]))) return;
+  touchPrefsSetEpdFullEveryN(k_epd_full_every_opts[i]);
+  epdApplyPolicy();
+  if (g_lv.task) g_lv.task->showAlert(TR("De-ghost interval saved"), 900);
+}
+
+static void epdFullOnScreenToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  touchPrefsSetEpdFullOnScreen(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+static void epdFullOnWakeToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  touchPrefsSetEpdFullOnWake(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+// Manual de-ghost. A settings row rather than a bar gesture: the status-bar 3 s
+// hold is already the SD screenshot.
+static void epdRefreshNowCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  display.requestFullRefresh();
+  display.serviceRefresh(true);          // bypass the minimum-interval throttle
+  if (g_lv.task) g_lv.task->showAlert(TR("Screen refreshed"), 900);
+}
+#endif  // HAS_TDECK_PRO
+
 static void clock12hToggleCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
@@ -14397,6 +14454,77 @@ static void buildDeviceSettings(int sec) {
   }
 
   if (sec == DSEC_DISPLAY) {   // --- Display ---
+#if defined(HAS_TDECK_PRO)
+    /* E-paper: how often the panel may change, and when it may flash to clear
+       ghosting. Both are real trade-offs rather than tuning knobs -- see the
+       epd_* field comments in TouchPrefsSchema.h. */
+    y += settingsRowLabel(body, y, 0, TR("E-paper refresh"), COLOR_TEXT, &g_font_12, 0) + 2;
+
+    y += settingsRowLabel(body, y, 0, TR("Minimum time between updates"), COLOR_SUB, &g_font_12, 0) + 2;
+    {
+      lv_obj_t* dd = lv_dropdown_create(body);
+      lv_dropdown_set_options(dd, "0.2 s\n0.25 s\n0.5 s\n1 s\n2 s\n5 s\n10 s");
+      const uint16_t cur = touchPrefsGetEpdMinRefreshMs();
+      uint16_t sel = 1;   // 0.25 s -- the shipped default
+      for (uint16_t i = 0; i < (sizeof(k_epd_interval_opts) / sizeof(k_epd_interval_opts[0])); ++i)
+        if (k_epd_interval_opts[i] == cur) { sel = i; break; }
+      lv_dropdown_set_selected(dd, sel);
+      lv_obj_set_width(dd, lv_pct(100));
+      lv_obj_set_pos(dd, 2, y);
+      styleDropdown(dd);
+      lv_obj_add_event_cb(dd, epdMinRefreshSelectCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += SC(34);
+    }
+
+    y += settingsRowLabel(body, y, 0, TR("Full de-ghost after"), COLOR_SUB, &g_font_12, 0) + 2;
+    {
+      lv_obj_t* dd = lv_dropdown_create(body);
+      lv_dropdown_set_options(dd, TR("Never\n3 updates\n5 updates\n9 updates\n20 updates\n40 updates"));
+      const uint8_t cur = touchPrefsGetEpdFullEveryN();
+      uint16_t sel = 3;   // "9 updates" -- the shipped default
+      for (uint16_t i = 0; i < (sizeof(k_epd_full_every_opts) / sizeof(k_epd_full_every_opts[0])); ++i)
+        if (k_epd_full_every_opts[i] == cur) { sel = i; break; }
+      lv_dropdown_set_selected(dd, sel);
+      lv_obj_set_width(dd, lv_pct(100));
+      lv_obj_set_pos(dd, 2, y);
+      styleDropdown(dd);
+      lv_obj_add_event_cb(dd, epdFullEverySelectCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += SC(34);
+    }
+    y += settingsRowLabel(body, y, 0,
+                          TR("a full refresh flashes the screen black to clear ghosting"),
+                          COLOR_SUB, &g_font_12, 0) + 2;
+
+    {
+      int h = settingsRowLabel(body, y, 6, TR("Full refresh on page change"), COLOR_SUB, nullptr, 56);
+      lv_obj_t* sw = lv_switch_create(body);
+      lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+      if (touchPrefsGetEpdFullOnScreen()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+      lv_obj_add_event_cb(sw, epdFullOnScreenToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += LV_MAX(SC(34), h + 12);
+    }
+    {
+      int h = settingsRowLabel(body, y, 6, TR("Full refresh on wake"), COLOR_SUB, nullptr, 56);
+      lv_obj_t* sw = lv_switch_create(body);
+      lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+      if (touchPrefsGetEpdFullOnWake()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+      lv_obj_add_event_cb(sw, epdFullOnWakeToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += LV_MAX(SC(34), h + 12);
+    }
+
+    {
+      lv_obj_t* b = lv_btn_create(body);
+      lv_obj_set_size(b, lv_pct(100), SC(34));
+      lv_obj_set_pos(b, 2, y);
+      styleButton(b);
+      lv_obj_add_event_cb(b, epdRefreshNowCb, LV_EVENT_CLICKED, nullptr);
+      lv_obj_t* l = lv_label_create(b);
+      useChainedFont(l);
+      lv_label_set_text(l, TR("Refresh screen now"));
+      lv_obj_center(l);
+      y += SC(42);
+    }
+#endif  // HAS_TDECK_PRO
   /* Screen timeout (seconds, 0 = never). Persists in NVS via TouchPrefsStore. */
   {
     y += settingsRowLabel(body, y, 0, TR("Screen timeout (s, 0 = never, min 10)"), COLOR_SUB, &g_font_12, 0) + 2;
@@ -55772,6 +55900,10 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       if (now - last_poll >= 8) { last_poll = now; pagerKeyboardPoll(); }
       delay(1);
     });
+  // Persisted refresh policy over the class defaults. ::display, not display --
+  // UITask::begin takes a DisplayDriver* parameter of the same name that shadows
+  // the global concrete instance here.
+  ::display.setRefreshPolicy(touchPrefsGetEpdMinRefreshMs(), touchPrefsGetEpdFullEveryN());
 #endif
 #endif
 #if defined(HAS_PAGER_ENCODER)
@@ -56969,6 +57101,12 @@ void UITask::wakeScreen() {
   _screen_off    = false;
   _manual_lock   = false;
   _last_input_ms = millis();
+#if defined(HAS_TDECK_PRO)
+  // E-paper keeps its last frame with the controller unpowered, so "screen off"
+  // leaves a readable image sitting there -- for hours, which is exactly the
+  // condition under which ghosting sets in. Clear it on the way back, if asked.
+  if (touchPrefsGetEpdFullOnWake()) ::display.requestFullRefresh();
+#endif
 }
 
 void UITask::lockScreen() {

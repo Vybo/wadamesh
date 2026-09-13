@@ -226,6 +226,23 @@ uint16_t touchPrefsGetGpsFuzzM();
 bool     touchPrefsSetGpsFuzzM(uint16_t m);
 bool    touchPrefsGetLoudAlerts();
 bool    touchPrefsSetLoudAlerts(bool on);
+
+/**
+ * E-paper refresh policy (v59). Read only by the T-Deck Pro; the fields exist on
+ * every board so the persisted blob layout stays board-independent.
+ *
+ * MinRefreshMs is the floor between panel commits, clamped to [200, 30000].
+ * FullEveryN forces a de-ghost after N partial updates; 0 legitimately means
+ * "never automatically" and is NOT clamped up.
+ */
+uint16_t touchPrefsGetEpdMinRefreshMs();
+bool     touchPrefsSetEpdMinRefreshMs(uint16_t ms);
+uint8_t  touchPrefsGetEpdFullEveryN();
+bool     touchPrefsSetEpdFullEveryN(uint8_t n);
+bool     touchPrefsGetEpdFullOnScreen();
+bool     touchPrefsSetEpdFullOnScreen(bool on);
+bool     touchPrefsGetEpdFullOnWake();
+bool     touchPrefsSetEpdFullOnWake(bool on);
 bool    touchPrefsGetBootWifiTimeOpen();
 bool    touchPrefsSetBootWifiTimeOpen(bool on);
 bool    touchPrefsGetBootAdvert();

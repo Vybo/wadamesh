@@ -41,6 +41,24 @@ public:
   void serviceRefresh(bool force = false);
   void setBusyHook(BusyHook hook) { _busy_hook = hook; }
 
+  // Refresh policy, driven from the persisted prefs rather than compiled in.
+  //
+  // Both numbers are a trade-off a user legitimately owns, not a tuning
+  // constant: the minimum interval trades staleness against how often the panel
+  // visibly changes, and the de-ghost count trades accumulated ghosting against
+  // how often the screen flashes to black. Someone reading static text wants the
+  // calmest possible screen; someone watching a chart wants freshness.
+  //
+  // full_every_n == 0 legitimately means "never de-ghost automatically" and is
+  // not clamped up.
+  void setRefreshPolicy(uint16_t min_interval_ms, uint8_t full_every_n);
+
+  // Public entry point for a deliberate de-ghost (settings action, page change,
+  // wake). requestRefresh() itself stays private: callers outside this class
+  // have no business scheduling an ordinary partial update -- that is what
+  // writePixelsRGB565 already does implicitly.
+  void requestFullRefresh() { requestRefresh(true); }
+
 private:
   using Panel = GxEPD2_310_GDEQ031T10;
   using Eink = GxEPD2_BW<Panel, 40>;
@@ -69,6 +87,10 @@ private:
   uint16_t _color = 0x0000;
   uint32_t _last_refresh_ms = 0;
   uint8_t _partial_refreshes = 0;
+  // Defaults match the constants these replaced, so behaviour is unchanged until
+  // a stored preference says otherwise.
+  uint16_t _min_interval_ms = 250;
+  uint8_t _full_every_n = 9;
   uint8_t _brightness = 255;
   bool _refresh_pending = false;
   bool _full_refresh_pending = true;
