@@ -57,6 +57,7 @@ public:
   // The keyboard at 0x34 doubles as a control -- if it shows and 0x1A does not,
   // the bus itself is fine.
   const char* i2cScan() const { return _i2c_scan; }
+  uint8_t touchAttempts() const { return _touch_attempts; }
   void serviceRefresh(bool force = false);
   void setBusyHook(BusyHook hook) { _busy_hook = hook; }
 
@@ -119,6 +120,7 @@ private:
   int16_t _dbg_raw_x = -1;   // last raw sample, BEFORE the bounds test
   int16_t _dbg_raw_y = -1;
   char _i2c_scan[40] = "(not run)";
+  uint8_t _touch_attempts = 0;   // how many begin() tries it took (or failed after)
   bool _sent_valid = false;
   bool _is_on = false;
 };

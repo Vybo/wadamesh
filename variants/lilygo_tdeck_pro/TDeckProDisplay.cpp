@@ -116,7 +116,20 @@ bool TDeckProDisplay::begin() {
   // _cst328.begin() is a POSITIVE identification (reset, debug mode, chip-ID
   // check, normal mode), so trying it first is safe for genuine CST3530 units
   // too: they fail its ID check and fall through to the probe below.
-  _touch_ready = _cst328.begin();
+  // RETRIED, because this init is demonstrably marginal. The identical driver
+  // binary has both worked and reported the controller missing across boots of
+  // the same unit, which is not a logic error -- it is CSE_CST328::begin()
+  // failing its chip-ID read. That read happens a few milliseconds after a
+  // hardware reset, on an I2C bus shared with the keyboard, IMU, gauge and
+  // charger, and a single failed attempt was being taken as "no CST328 here".
+  //
+  // Each retry re-runs the hardware reset first: the chip needs its reset
+  // window respected, and re-probing without one just repeats the same failure.
+  for (uint8_t attempt = 0; attempt < 3 && !_touch_ready; ++attempt) {
+    if (attempt) { resetTouch(); delay(20); }
+    _touch_ready = _cst328.begin();
+    _touch_attempts = (uint8_t)(attempt + 1);
+  }
   if (_touch_ready) {
     _touch_is_cst3530 = false;
     _cst328.setRotation(0);

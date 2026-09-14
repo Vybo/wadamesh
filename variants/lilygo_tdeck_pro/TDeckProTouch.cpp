@@ -96,9 +96,10 @@ const char* heltecV4CapTouchDebug() {
   static char buf[128];
   int16_t rx = -1, ry = -1;
   display.lastTouchRaw(rx, ry);
-  snprintf(buf, sizeof buf, "touch %s%s raw=%d,%d\ni2c: %s",
+  snprintf(buf, sizeof buf, "touch %s%s try=%u raw=%d,%d\ni2c: %s",
            display.touchKindName(),
-           display.touchReady() ? "" : " MISSING", (int)rx, (int)ry,
+           display.touchReady() ? "" : " MISSING",
+           (unsigned)display.touchAttempts(), (int)rx, (int)ry,
            display.i2cScan());
   return buf;
 }

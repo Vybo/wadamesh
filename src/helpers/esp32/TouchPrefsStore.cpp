@@ -2145,12 +2145,13 @@ void touchPrefsSetEdgeScroll(bool on)      { if (!s_begun) touchPrefsBegin(); pr
 // drawn), so on this board it is the sane default rather than an extra.
 bool touchPrefsGetLockOnScreenOff() {
   if (!s_begun) touchPrefsBegin();
-#if defined(HAS_TDECK_PRO)
-  const uint8_t dflt = 1;
-#else
-  const uint8_t dflt = 0;
-#endif
-  return s_prefs.getUChar("lock_off", dflt) != 0;
+  // Deliberately NOT defaulted on for the T-Deck Pro any more, even though a
+  // locked e-paper screen is the behaviour that board wants. Locking makes touch
+  // inert by design, so ON-by-default turns any touch-init failure into a device
+  // you cannot get into at all -- which is exactly what happened on the first
+  // build that shipped it. It stays a one-tap setting (Settings -> Lock), and
+  // should go back to defaulting on once touch init is reliable.
+  return s_prefs.getUChar("lock_off", 0) != 0;
 }
 void touchPrefsSetLockOnScreenOff(bool on) { if (!s_begun) touchPrefsBegin(); prefsPutUChar("lock_off", on ? 1 : 0); }
 bool touchPrefsGetGlanceWhenLocked() { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("glance_lck", 0) != 0; }
