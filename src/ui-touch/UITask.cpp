@@ -1867,6 +1867,21 @@ static void setSelectionGlow(lv_obj_t* obj, bool selected, lv_style_selector_t s
   if (!obj) return;
   if (!s_selection_glow_style_ready) {
     lv_style_init(&s_selection_glow_style);
+#if defined(HAS_TDECK_PRO)
+    // A "glow" is a blurred shadow in an accent colour. At one bit both halves
+    // of that vanish: the blur has no intermediate levels to render into, and
+    // the accent thresholds to the same ink as whatever it sits on -- so the
+    // selected item looked identical to its neighbours.
+    //
+    // Solid black outline instead, offset by a pad so it reads as a SECOND
+    // border outside the control's own 2 px one. Two concentric hard lines are
+    // unambiguous at 1 bpp in a way no single-line or tonal cue is.
+    lv_style_set_outline_width(&s_selection_glow_style, 2);
+    lv_style_set_outline_pad(&s_selection_glow_style, 3);
+    lv_style_set_outline_opa(&s_selection_glow_style, LV_OPA_COVER);
+    lv_style_set_outline_color(&s_selection_glow_style, lv_color_black());
+    lv_style_set_shadow_width(&s_selection_glow_style, 0);   // no blur to threshold
+#else
     lv_style_set_outline_width(&s_selection_glow_style, 3);
     lv_style_set_outline_pad(&s_selection_glow_style, 2);
     lv_style_set_outline_opa(&s_selection_glow_style, LV_OPA_COVER);
@@ -1875,6 +1890,7 @@ static void setSelectionGlow(lv_obj_t* obj, bool selected, lv_style_selector_t s
     lv_style_set_shadow_opa(&s_selection_glow_style, LV_OPA_70);
     lv_style_set_outline_color(&s_selection_glow_style, lv_color_hex(COLOR_ACCENT));
     lv_style_set_shadow_color(&s_selection_glow_style, lv_color_hex(COLOR_ACCENT));
+#endif
     s_selection_glow_style_ready = true;
   }
   lv_obj_remove_style(obj, &s_selection_glow_style, selector);
@@ -13055,7 +13071,11 @@ static void msgFlashToggleCb(lv_event_t* e) {
 // Dropdowns rather than sliders on purpose: on a bistable panel every drag step
 // of a slider is its own panel commit, so a slider is actively unpleasant to
 // operate. A short list of discrete values is one commit per choice.
-static const uint16_t k_epd_interval_opts[] = { 200, 250, 500, 1000, 2000, 5000, 10000 };
+// 0 = no software floor at all: commit as soon as a frame is ready and let the
+// panel be the limit. The controller's own partial update is the real ceiling
+// (GxEPD2 declares 700 ms for this panel, Good Display quotes 0.4 s), so the
+// fastest entries here mean "never wait longer than the hardware already does".
+static const uint16_t k_epd_interval_opts[] = { 0, 100, 200, 250, 500, 1000, 2000, 5000 };
 static const uint8_t  k_epd_full_every_opts[] = { 0, 3, 5, 9, 20, 40 };
 
 static void epdApplyPolicy() {
@@ -14484,9 +14504,9 @@ static void buildDeviceSettings(int sec) {
     y += settingsRowLabel(body, y, 0, TR("Minimum time between updates"), COLOR_SUB, &g_font_12, 0) + 2;
     {
       lv_obj_t* dd = lv_dropdown_create(body);
-      lv_dropdown_set_options(dd, "0.2 s\n0.25 s\n0.5 s\n1 s\n2 s\n5 s\n10 s");
+      lv_dropdown_set_options(dd, TR("As fast as possible\n0.1 s\n0.2 s\n0.25 s\n0.5 s\n1 s\n2 s\n5 s"));
       const uint16_t cur = touchPrefsGetEpdMinRefreshMs();
-      uint16_t sel = 1;   // 0.25 s -- the shipped default
+      uint16_t sel = 3;   // 0.25 s -- the shipped default
       for (uint16_t i = 0; i < (sizeof(k_epd_interval_opts) / sizeof(k_epd_interval_opts[0])); ++i)
         if (k_epd_interval_opts[i] == cur) { sel = i; break; }
       lv_dropdown_set_selected(dd, sel);
@@ -35265,8 +35285,16 @@ static void makeSettings(lv_obj_t* tab) {
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN | LV_STATE_PRESSED);
     lv_obj_set_style_radius(card, 10, LV_PART_MAIN);
+#if defined(HAS_TDECK_PRO)
+    // These cards never went through styleButton(), so they kept a 1 px border
+    // in a themed colour -- which thresholds to paper on a 1 bpp panel, leaving
+    // the settings list looking like unframed text. Give them the same solid
+    // outline every other control on this board gets.
+    styleEpaperControlOutline(card, LV_PART_MAIN);
+#else
     lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
     lv_obj_set_style_border_color(card, lv_color_hex(themeRole(0x2A2E34, COLOR_BORDER)), LV_PART_MAIN);
+#endif
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(card, settingsCatOpenCb, LV_EVENT_CLICKED, (void*)(intptr_t)c);
 

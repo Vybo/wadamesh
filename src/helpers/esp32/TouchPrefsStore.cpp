@@ -1244,7 +1244,10 @@ bool touchPrefsSetGpsFuzzM(uint16_t m) {
 // ---- v59 e-paper refresh policy ----------------------------------------
 // Clamped on both read and write: a corrupt stored byte must not be able to ask
 // a bistable panel for a rate it cannot physically sustain.
-static const uint16_t EPD_MIN_REFRESH_MS_MIN = 200;    // below the panel's own partial-update time
+// 0 is meaningful: no software floor, so the panel's own partial-update time is
+// the only limit. Clamping above that buys nothing -- the hardware already
+// enforces its own minimum by simply taking that long to refresh.
+static const uint16_t EPD_MIN_REFRESH_MS_MIN = 0;
 static const uint16_t EPD_MIN_REFRESH_MS_MAX = 30000;  // 30 s -- effectively "only on demand"
 static const uint8_t  EPD_FULL_EVERY_MAX     = 60;
 

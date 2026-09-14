@@ -69,7 +69,11 @@ bool TDeckProDisplay::begin() {
 
   Wire.begin(PIN_BOARD_SDA, PIN_BOARD_SCL, 400000);
 
-  // Scan before touching anything, so the result describes the bus as found.
+  resetTouch();
+
+  // Scan AFTER the reset, not before. A CST328 does not ACK until it has been
+  // reset, so a scan taken first reports no 0x1A on a board that plainly has
+  // one -- which is exactly how this diagnostic first misled us.
   {
     size_t n = 0;
     _i2c_scan[0] = '\0';
@@ -81,7 +85,7 @@ bool TDeckProDisplay::begin() {
     if (n == 0) snprintf(_i2c_scan, sizeof _i2c_scan, "(bus empty)");
   }
 
-  resetTouch();
+
   // TDECK_PRO_TOUCH_FORCE overrides the probe: 328 or 3530. Unset = probe.
   //
   // The probe tests for a 0xCACA reply, but 0xCACA is ALSO the CST328's own
@@ -92,18 +96,38 @@ bool TDeckProDisplay::begin() {
   // can be settled on a device in two flashes instead of by argument.
 #if defined(TDECK_PRO_TOUCH_FORCE) && (TDECK_PRO_TOUCH_FORCE == 3530)
   _touch_is_cst3530 = true;
+  pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
+  _touch_ready = initCst3530();
 #elif defined(TDECK_PRO_TOUCH_FORCE) && (TDECK_PRO_TOUCH_FORCE == 328)
   _touch_is_cst3530 = false;
+  _touch_ready = _cst328.begin();
+  if (_touch_ready) _cst328.setRotation(0);
 #else
-  _touch_is_cst3530 = probeCst3530();
-#endif
-  if (_touch_is_cst3530) {
-    pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
-    _touch_ready = initCst3530();
-  } else {
-    _touch_ready = _cst328.begin();
+  // CST328 FIRST, and identified by its own driver rather than by our probe.
+  //
+  // probeCst3530() tests for a 0xCACA reply -- but 0xCACA is the CST328's OWN
+  // debug-mode chip ID (CSE_CST328 enters 0xD101, reads the info register and
+  // checks (id >> 16) == 0xCACA), so it is NOT exclusive to the 3530. Measured
+  // on hardware: a CST328 unit answers that probe, gets sorted into the 3530
+  // branch, initCst3530() then fails, and touch is reported missing entirely --
+  // while the keyboard on the same bus is fine. Forcing the CST328 path on the
+  // same unit works.
+  //
+  // _cst328.begin() is a POSITIVE identification (reset, debug mode, chip-ID
+  // check, normal mode), so trying it first is safe for genuine CST3530 units
+  // too: they fail its ID check and fall through to the probe below.
+  _touch_ready = _cst328.begin();
+  if (_touch_ready) {
+    _touch_is_cst3530 = false;
     _cst328.setRotation(0);
+  } else {
+    _touch_is_cst3530 = probeCst3530();
+    if (_touch_is_cst3530) {
+      pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
+      _touch_ready = initCst3530();
+    }
   }
+#endif
 
   _is_on = true;
   Serial.printf("[BOOT] T-Deck Pro e-paper ready touch=%s\n",
