@@ -15,12 +15,27 @@ TDeckProDisplay::BusyHook TDeckProDisplay::_busy_hook = nullptr;
   #undef  PIN_TOUCH_RST
   #define PIN_TOUCH_RST 45
 #endif
+// Touch reset differs by hardware revision; both are tried at runtime.
+#ifndef TDECK_PRO_TOUCH_RST_V11
+  #define TDECK_PRO_TOUCH_RST_V11 38
+#endif
+#ifndef TDECK_PRO_TOUCH_RST_V10
+  #define TDECK_PRO_TOUCH_RST_V10 45
+#endif
+#ifndef PIN_BOARD_1V8_EN
+  #define PIN_BOARD_1V8_EN 38        // v1.0 only; v1.1 uses this pin as touch reset
+#endif
+
 
 TDeckProDisplay::TDeckProDisplay()
     : DisplayDriver(WIDTH, HEIGHT),
       _canvas(nullptr),
       _epd(Panel(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST, PIN_TFT_BUSY)),
-      _cst328(WIDTH, HEIGHT, &Wire, PIN_TOUCH_RST, PIN_TOUCH_INT) {}
+      // Reset pin -1: the library must NOT own it. Which GPIO is the touch reset
+      // differs between hardware revisions (45 on v1.0, 38 on v1.1) and is
+      // decided at runtime below, so the reset is driven by touchTryWiring().
+      // CSE_CST328::begin() skips its own reset when this is -1.
+      _cst328(WIDTH, HEIGHT, &Wire, -1, PIN_TOUCH_INT) {}
 
 bool TDeckProDisplay::begin() {
   const uint8_t selects[] = { PIN_TFT_CS, P_LORA_NSS, PIN_SD_CS };
@@ -48,85 +63,70 @@ bool TDeckProDisplay::begin() {
   _epd.setRotation(0);
   _epd.epd2.setBusyCallback(&TDeckProDisplay::busyCallback);
 
-#if !defined(TDECK_PRO_HW_V10)
-  ledcSetup(TDECK_PRO_FRONTLIGHT_CHANNEL, 12000, 8);
-  ledcAttachPin(PIN_TFT_LEDA_CTL, TDECK_PRO_FRONTLIGHT_CHANNEL);
-#else
-  // HARDWARE v1.0: GPIO45 is the TOUCH RESET on this revision, not a frontlight.
-  // Attaching an LEDC channel to it and writing 0 (which is what happens a few
-  // lines below on v1.1) holds the touch controller in reset for the whole
-  // session -- it never ACKs on I2C, so the driver reports no touch at all
-  // while the keyboard, which has no reset line, keeps working normally.
-  //
-  // v1.0 also puts the 1.8 V rail enable on GPIO38, which is where v1.1 puts
-  // the touch reset -- so the two pins are effectively swapped between
-  // revisions, and getting it wrong disables touch in both directions.
-  pinMode(PIN_BOARD_1V8_EN, OUTPUT);
-  digitalWrite(PIN_BOARD_1V8_EN, HIGH);   // rail up before anything is addressed
-  delay(10);
-#endif
-  writeBrightness(0);
-
+  // NOTE: the frontlight LEDC is deliberately NOT attached here. On hardware
+  // v1.0 GPIO45 is the TOUCH RESET, not a frontlight -- attaching a channel and
+  // writing 0 (which is what this used to do) holds the touch controller in
+  // reset for the entire session. It never ACKs, touch reports missing, and the
+  // keyboard on the same bus keeps working, which is exactly how this presented.
+  // The channel is attached after the revision is known, below.
   Wire.begin(PIN_BOARD_SDA, PIN_BOARD_SCL, 400000);
 
-  resetTouch();
-
-
-  // TDECK_PRO_TOUCH_FORCE overrides the probe: 328 or 3530. Unset = probe.
+  // Which GPIO is the touch reset depends on the board revision, and the two
+  // revisions effectively swap two pins:
   //
-  // The probe tests for a 0xCACA reply, but 0xCACA is ALSO the CST328's own
-  // debug-mode chip ID (CSE_CST328 enters 0xD101, reads the info register and
-  // checks (id >> 16) == 0xCACA), so it is not obviously exclusive. A unit whose
-  // controller is mis-sorted gets driven with entirely the wrong protocol and
-  // touch is simply dead, with nothing to say why. The override exists so that
-  // can be settled on a device in two flashes instead of by argument.
-#if defined(TDECK_PRO_TOUCH_FORCE) && (TDECK_PRO_TOUCH_FORCE == 3530)
-  _touch_is_cst3530 = true;
-  pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
-  _touch_ready = initCst3530();
-#elif defined(TDECK_PRO_TOUCH_FORCE) && (TDECK_PRO_TOUCH_FORCE == 328)
-  _touch_is_cst3530 = false;
-  _touch_ready = _cst328.begin();
-  if (_touch_ready) _cst328.setRotation(0);
+  //   v1.0 : touch reset = GPIO45, GPIO38 = 1.8 V rail enable, no frontlight
+  //   v1.1 : touch reset = GPIO38, GPIO45 = frontlight
+  //
+  // Getting it wrong is silent and total -- the controller simply stays in reset
+  // and never answers -- so rather than trust a build flag, try the compiled
+  // preference first and fall back to the other. One binary then works on both,
+  // and the flag only chooses which is attempted first.
+  // v1.0 is tried FIRST, and the asymmetry of getting it wrong is why:
+  //
+  //   wrong order on a v1.0 board -> the v1.1 attempt pulses GPIO38 LOW, and on
+  //     v1.0 that pin is the 1.8 V rail enable. Cutting the rail under the touch
+  //     controller (and whatever else it feeds) to probe a pin is a real risk.
+  //   wrong order on a v1.1 board -> the v1.0 attempt drives GPIO38 high (which
+  //     on v1.1 just holds reset inactive) and pulses GPIO45 (the frontlight).
+  //     Harmless; the cost is that a v1.1 unit can answer on the first attempt
+  //     and be recorded as v1.0, losing only its frontlight.
+  //
+  // A cosmetic loss on one revision beats power-cycling a rail on the other, so
+  // the safe order is v1.0 first. TDECK_PRO_HW_V11 forces the other preference
+  // for a board where the frontlight matters more than the margin.
+#if defined(TDECK_PRO_HW_V11)
+  const bool prefer_v10 = false;
 #else
-  // CST328 FIRST, and identified by its own driver rather than by our probe.
-  //
-  // probeCst3530() tests for a 0xCACA reply -- but 0xCACA is the CST328's OWN
-  // debug-mode chip ID (CSE_CST328 enters 0xD101, reads the info register and
-  // checks (id >> 16) == 0xCACA), so it is NOT exclusive to the 3530. Measured
-  // on hardware: a CST328 unit answers that probe, gets sorted into the 3530
-  // branch, initCst3530() then fails, and touch is reported missing entirely --
-  // while the keyboard on the same bus is fine. Forcing the CST328 path on the
-  // same unit works.
-  //
-  // _cst328.begin() is a POSITIVE identification (reset, debug mode, chip-ID
-  // check, normal mode), so trying it first is safe for genuine CST3530 units
-  // too: they fail its ID check and fall through to the probe below.
-  // RETRIED, because this init is demonstrably marginal. The identical driver
-  // binary has both worked and reported the controller missing across boots of
-  // the same unit, which is not a logic error -- it is CSE_CST328::begin()
-  // failing its chip-ID read. That read happens a few milliseconds after a
-  // hardware reset, on an I2C bus shared with the keyboard, IMU, gauge and
-  // charger, and a single failed attempt was being taken as "no CST328 here".
-  //
-  // Each retry re-runs the hardware reset first: the chip needs its reset
-  // window respected, and re-probing without one just repeats the same failure.
-  for (uint8_t attempt = 0; attempt < 3 && !_touch_ready; ++attempt) {
-    if (attempt) { resetTouch(); delay(20); }
-    _touch_ready = _cst328.begin();
-    _touch_attempts = (uint8_t)(attempt + 1);
+  const bool prefer_v10 = true;
+#endif
+  _touch_ready = touchTryWiring(prefer_v10);
+  _hw_rev_v10 = prefer_v10;
+  if (!_touch_ready) {
+    _touch_ready = touchTryWiring(!prefer_v10);
+    if (_touch_ready) _hw_rev_v10 = !prefer_v10;
   }
   if (_touch_ready) {
     _touch_is_cst3530 = false;
     _cst328.setRotation(0);
   } else {
+    // Neither wiring produced a CST328. Only now is the CST3530 worth trying;
+    // it is the rarer part, and its probe shares 0xCACA with the CST328's own
+    // debug-mode chip ID, so it must never be consulted first.
     _touch_is_cst3530 = probeCst3530();
     if (_touch_is_cst3530) {
       pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
       _touch_ready = initCst3530();
     }
   }
-#endif
+
+  // Frontlight, now that the revision is known. v1.0 has none, and GPIO45 there
+  // is the touch reset we just used -- attaching a PWM channel to it would undo
+  // the init that just succeeded.
+  if (!_hw_rev_v10) {
+    ledcSetup(TDECK_PRO_FRONTLIGHT_CHANNEL, 12000, 8);
+    ledcAttachPin(PIN_TFT_LEDA_CTL, TDECK_PRO_FRONTLIGHT_CHANNEL);
+    writeBrightness(0);
+  }
 
   // I2C scan, deliberately LAST -- after the touch controller is initialised.
   //
@@ -287,11 +287,10 @@ void TDeckProDisplay::setBrightness(uint8_t brightness) {
 }
 
 void TDeckProDisplay::writeBrightness(uint8_t brightness) {
-#if !defined(TDECK_PRO_HW_V10)
+  // v1.0 has no frontlight, and its GPIO45 is the touch reset -- driving a PWM
+  // channel there would reset the touch controller on every brightness change.
+  if (_hw_rev_v10) { (void)brightness; return; }
   ledcWrite(TDECK_PRO_FRONTLIGHT_CHANNEL, brightness);
-#else
-  (void)brightness;   // no frontlight pin on v1.0 -- see the note in begin()
-#endif
 }
 
 void TDeckProDisplay::setRefreshPolicy(uint16_t min_interval_ms, uint8_t full_every_n) {
@@ -349,6 +348,33 @@ void TDeckProDisplay::canvasToMono() {
         _mono[(size_t)y * (WIDTH / 8) + ((size_t)x >> 3)] &= (uint8_t)~(0x80u >> (x & 7));
     }
   }
+}
+
+// Bring the touch controller up assuming one specific board revision, and
+// report whether it answered. Safe to call for the wrong revision: the worst
+// case is a brief pulse on a pin that is not the reset, and a failed chip-ID
+// read. CSE_CST328::begin() leaves `inited` false on failure, so a second call
+// with the other wiring is a genuine retry rather than a cached success.
+bool TDeckProDisplay::touchTryWiring(bool v10) {
+  const int rst_pin = v10 ? TDECK_PRO_TOUCH_RST_V10 : TDECK_PRO_TOUCH_RST_V11;
+  if (v10) {
+    // The 1.8 V rail feeds the touch controller on this revision; nothing
+    // answers until it is up.
+    pinMode(PIN_BOARD_1V8_EN, OUTPUT);
+    digitalWrite(PIN_BOARD_1V8_EN, HIGH);
+    delay(10);
+  }
+  pinMode(rst_pin, OUTPUT);
+  digitalWrite(rst_pin, HIGH); delay(20);
+  digitalWrite(rst_pin, LOW);  delay(80);
+  digitalWrite(rst_pin, HIGH); delay(120);   // TRON is 200 ms worst case; begin() retries too
+
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    _touch_attempts++;
+    if (_cst328.begin()) return true;
+    delay(20);
+  }
+  return false;
 }
 
 void TDeckProDisplay::resetTouch() {

@@ -58,6 +58,7 @@ public:
   // the bus itself is fine.
   const char* i2cScan() const { return _i2c_scan; }
   uint8_t touchAttempts() const { return _touch_attempts; }
+  bool hwRevV10() const { return _hw_rev_v10; }
   void serviceRefresh(bool force = false);
   void setBusyHook(BusyHook hook) { _busy_hook = hook; }
 
@@ -121,6 +122,8 @@ private:
   int16_t _dbg_raw_y = -1;
   char _i2c_scan[40] = "(not run)";
   uint8_t _touch_attempts = 0;   // how many begin() tries it took (or failed after)
+  bool _hw_rev_v10 = false;      // which wiring actually brought touch up
+  bool touchTryWiring(bool v10);
   bool _sent_valid = false;
   bool _is_on = false;
 };
