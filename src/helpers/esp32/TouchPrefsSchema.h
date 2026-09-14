@@ -9,7 +9,7 @@
 namespace TouchPrefsSchema {
 
 static constexpr uint16_t MAGIC = 0x5743;   // 'WC' (WadaCfg)
-static constexpr uint8_t CURRENT_VERSION = 59;   // v49: fem_lna default flip on the V4-R8; v50: map tile z/x/y line off by default (no new fields); v51: console_mode (boot into the text console; new trailing field, default OFF); v52: console_monitor (show incoming messages in the console, default ON); v54: boot_wifi_time + boot_wifi_open (cold-boot saved-Wi-Fi time sync, #383; both OFF); v55: loud_alerts (resonant-pitch chime, #388; OFF); v56: theme_mode (Day/Night firmware theme, #296; default Night); v57: gps_fuzz_m (displace the advertised position, #399; 0 = off); v58: Attaky notification blink enable + room/DM color indexes (#423); v59: epd_* e-paper refresh policy (T-Deck Pro; four trailing fields, inert on every other board)
+static constexpr uint8_t CURRENT_VERSION = 60;   // v49: fem_lna default flip on the V4-R8; v50: map tile z/x/y line off by default (no new fields); v51: console_mode (boot into the text console; new trailing field, default OFF); v52: console_monitor (show incoming messages in the console, default ON); v54: boot_wifi_time + boot_wifi_open (cold-boot saved-Wi-Fi time sync, #383; both OFF); v55: loud_alerts (resonant-pitch chime, #388; OFF); v56: theme_mode (Day/Night firmware theme, #296; default Night); v57: gps_fuzz_m (displace the advertised position, #399; 0 = off); v58: Attaky notification blink enable + room/DM color indexes (#423); v59: epd_* e-paper refresh policy (T-Deck Pro; four trailing fields, inert on every other board); v60: epd_lock_refresh_s + epd_modal_dither
 static constexpr uint8_t BROKEN_MID_INSERT_VERSION = 44;
 
 // Persisted byte layout. New fields must be appended at the end: older blobs
@@ -125,6 +125,16 @@ struct __attribute__((packed)) Config {
   uint8_t  epd_full_every_n;     // de-ghost after N partials; 0 = never automatically
   uint8_t  epd_full_on_screen;   // de-ghost when the whole screen changes (tab/page switch)
   uint8_t  epd_full_on_wake;     // de-ghost on wake, clearing ghosting accrued while asleep
+  // v60. A bistable panel holds its last image with the controller unpowered,
+  // so a locked device keeps showing a clock that is quietly wrong. This is how
+  // often to wake just far enough to redraw it. Seconds; 0 = never.
+  uint16_t epd_lock_refresh_s;
+  // Dim the background behind a modal with a 50% dither screen instead of a
+  // translucent black. At 1 bpp a translucent overlay has nothing to be
+  // translucent INTO -- it blends and then thresholds, so the page behind the
+  // dialog goes solid black and its context is lost. A dither keeps every other
+  // pixel, so the page stays legible as texture behind the dialog.
+  uint8_t  epd_modal_dither;
 };
 
 static constexpr size_t HEADER_SIZE = offsetof(Config, bright);
@@ -140,8 +150,14 @@ static_assert(offsetof(Config, web_mirror) == offsetof(Config, rx_queue) + sizeo
 // whichever board is using the file backend. 117 bytes today.
 static_assert(sizeof(Config) <= 2048,
               "Config exceeds the SdNvsPrefs value cap; prefs would silently stop saving");
-static_assert(offsetof(Config, epd_full_on_wake) + sizeof(Config::epd_full_on_wake) == sizeof(Config),
+static_assert(offsetof(Config, epd_modal_dither) + sizeof(Config::epd_modal_dither) == sizeof(Config),
               "new preference fields must remain trailing");
+static_assert(offsetof(Config, epd_lock_refresh_s) ==
+                  offsetof(Config, epd_full_on_wake) + sizeof(Config::epd_full_on_wake),
+              "epd_lock_refresh_s must follow epd_full_on_wake");
+static_assert(offsetof(Config, epd_modal_dither) ==
+                  offsetof(Config, epd_lock_refresh_s) + sizeof(Config::epd_lock_refresh_s),
+              "epd_modal_dither must follow epd_lock_refresh_s");
 static_assert(offsetof(Config, epd_min_refresh_ms) ==
                   offsetof(Config, attaky_notify_dm_color) + sizeof(Config::attaky_notify_dm_color),
               "epd_min_refresh_ms must follow attaky_notify_dm_color");

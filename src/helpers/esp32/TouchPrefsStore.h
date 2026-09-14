@@ -243,6 +243,15 @@ bool     touchPrefsGetEpdFullOnScreen();
 bool     touchPrefsSetEpdFullOnScreen(bool on);
 bool     touchPrefsGetEpdFullOnWake();
 bool     touchPrefsSetEpdFullOnWake(bool on);
+
+/** Seconds between lock-screen redraws while locked/asleep; 0 = never.
+ *  Clamped to 0 or [15, 3600]. */
+uint16_t touchPrefsGetEpdLockRefreshSecs();
+bool     touchPrefsSetEpdLockRefreshSecs(uint16_t secs);
+
+/** Dither the page behind a modal instead of blacking it out. */
+bool     touchPrefsGetEpdModalDither();
+bool     touchPrefsSetEpdModalDither(bool on);
 bool    touchPrefsGetBootWifiTimeOpen();
 bool    touchPrefsSetBootWifiTimeOpen(bool on);
 bool    touchPrefsGetBootAdvert();

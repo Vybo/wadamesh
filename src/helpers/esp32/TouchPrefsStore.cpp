@@ -154,6 +154,8 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.epd_full_every_n   = 9;
   c.epd_full_on_screen = 1;   // a page switch changes everything; partial-updating it smears
   c.epd_full_on_wake   = 1;   // clear whatever ghosting accrued while the panel sat idle
+  c.epd_lock_refresh_s = 60;  // once a minute: enough to keep a locked clock honest
+  c.epd_modal_dither   = 1;   // dither the page behind a dialog rather than black it out
   c.compact_chat      = 0;      // OFF: bubble chat layout (opt-in IRC-style dense rows)
   c.clock_floor       = 0;      // no persisted send-timestamp floor yet
   c.rx_queue          = 1;      // ON: buffered receive (test-channel default; opt-out toggle in Radio & Mesh)
@@ -283,6 +285,10 @@ static void cfgLoadOrMigrate() {
           s_cfg.epd_full_every_n   = 9;
           s_cfg.epd_full_on_screen = 1;
           s_cfg.epd_full_on_wake   = 1;
+        }
+        if (stored_version < 60) {
+          s_cfg.epd_lock_refresh_s = 60;
+          s_cfg.epd_modal_dither   = 1;
         }
         if (stored_version < 31) s_cfg.compact_chat = 0;  // new trailing field: compact chat rows off by default
         if (stored_version < 32) s_cfg.clock_floor = 0;   // new trailing field: no send-timestamp floor persisted yet (#89)
@@ -1281,6 +1287,40 @@ bool touchPrefsSetEpdFullEveryN(uint8_t n) {
   return cfgFlush();
 }
 
+// Seconds between redraws of the lock screen while the device is locked or
+// asleep. Clamped to 0 (off) or >= 15 s: anything faster is a panel update the
+// user is not looking at, on a device that is supposed to be idle.
+static const uint16_t EPD_LOCK_REFRESH_MIN_S = 15;
+static const uint16_t EPD_LOCK_REFRESH_MAX_S = 3600;
+
+uint16_t touchPrefsGetEpdLockRefreshSecs() {
+  if (!s_begun) touchPrefsBegin();
+  uint16_t v = s_cfg.epd_lock_refresh_s;
+  if (v == 0) return 0;
+  if (v < EPD_LOCK_REFRESH_MIN_S) v = EPD_LOCK_REFRESH_MIN_S;
+  if (v > EPD_LOCK_REFRESH_MAX_S) v = EPD_LOCK_REFRESH_MAX_S;
+  return v;
+}
+bool touchPrefsSetEpdLockRefreshSecs(uint16_t secs) {
+  if (secs != 0) {
+    if (secs < EPD_LOCK_REFRESH_MIN_S) secs = EPD_LOCK_REFRESH_MIN_S;
+    if (secs > EPD_LOCK_REFRESH_MAX_S) secs = EPD_LOCK_REFRESH_MAX_S;
+  }
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_lock_refresh_s = secs;
+  return cfgFlush();
+}
+
+bool touchPrefsGetEpdModalDither() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.epd_modal_dither != 0;
+}
+bool touchPrefsSetEpdModalDither(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.epd_modal_dither = on ? 1 : 0;
+  return cfgFlush();
+}
+
 bool touchPrefsGetEpdFullOnScreen() {
   if (!s_begun) touchPrefsBegin();
   return s_cfg.epd_full_on_screen != 0;
@@ -2097,7 +2137,21 @@ bool touchPrefsGetScrollReverse()   { if (!s_begun) touchPrefsBegin(); return s_
 void touchPrefsSetScrollReverse(bool on)   { if (!s_begun) touchPrefsBegin(); prefsPutUChar("tb_rev", on ? 1 : 0); }
 bool touchPrefsGetEdgeScroll()      { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("tb_edgesc", 0) != 0; }
 void touchPrefsSetEdgeScroll(bool on)      { if (!s_begun) touchPrefsBegin(); prefsPutUChar("tb_edgesc", on ? 1 : 0); }
-bool touchPrefsGetLockOnScreenOff() { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("lock_off", 0) != 0; }
+// Default ON for the T-Deck Pro. Everywhere else a dark panel is self-evidently
+// off, so locking as well is an opt-in anti-pocket-tap measure. E-paper has no
+// such signal: it keeps displaying the last screen with the power removed, so a
+// timed-out device looks exactly like a live one and the touchscreen stays hot.
+// Locking is what makes the state visible (and the lock screen is what gets
+// drawn), so on this board it is the sane default rather than an extra.
+bool touchPrefsGetLockOnScreenOff() {
+  if (!s_begun) touchPrefsBegin();
+#if defined(HAS_TDECK_PRO)
+  const uint8_t dflt = 1;
+#else
+  const uint8_t dflt = 0;
+#endif
+  return s_prefs.getUChar("lock_off", dflt) != 0;
+}
 void touchPrefsSetLockOnScreenOff(bool on) { if (!s_begun) touchPrefsBegin(); prefsPutUChar("lock_off", on ? 1 : 0); }
 bool touchPrefsGetGlanceWhenLocked() { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("glance_lck", 0) != 0; }
 void touchPrefsSetGlanceWhenLocked(bool on) { if (!s_begun) touchPrefsBegin(); prefsPutUChar("glance_lck", on ? 1 : 0); }

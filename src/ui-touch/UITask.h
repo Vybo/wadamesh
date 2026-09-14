@@ -333,6 +333,9 @@ public:
   void showAlert(const char* text, int duration_millis);
   int  getMsgCount() const { return _msgcount; }
   int  getUnreadTotal() const;
+  /** Same filtered set getUnreadTotal() counts, split by thread kind.
+   *  Either pointer may be null. */
+  void getUnreadSplit(int* channels, int* contacts) const;
   int  getUnreadMentionCount() const;   // # of threads with an unread @mention of me
   void markThreadRead(int idx);   // clear one thread's unread count (persisted)
   // Console mode: list threads with their unread counts (read-only), and clear

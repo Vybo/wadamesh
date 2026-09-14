@@ -3207,6 +3207,41 @@ static void normalizeLightSurfaceRecolor(char* text) {
 }
 
 #if defined(HAS_TDECK_PRO)
+// A 50% checkerboard used as the backdrop behind modals, in place of a
+// translucent black.
+//
+// A translucent overlay needs intermediate levels to be translucent INTO. At one
+// bit there are none: LVGL blends the scrim with the page, the result crosses
+// the ink threshold almost everywhere, and the page behind the dialog goes
+// solid black. The dialog then floats on a void with none of the context the
+// dimming was supposed to preserve.
+//
+// Tiling a 2x2 image of two opaque black pixels and two transparent ones keeps
+// every other pixel of the page, which reads as a grey wash at this pixel pitch
+// and leaves the text underneath recognisable. bg_opa is TRANSPARENT so only
+// the tiled image draws.
+#if defined(HAS_TDECK_PRO)
+static const uint8_t kDitherScrimPx[] = {
+  // LV_IMG_CF_TRUE_COLOR_ALPHA at LV_COLOR_DEPTH 16: RGB565 little-endian + alpha.
+  0x00, 0x00, 0xFF,   0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00,   0x00, 0x00, 0xFF,
+};
+static const lv_img_dsc_t kDitherScrim = {
+  { LV_IMG_CF_TRUE_COLOR_ALPHA, 0, 0, 2, 2 },
+  sizeof kDitherScrimPx,
+  kDitherScrimPx,
+};
+
+// Replace a translucent fill with the dither screen. Falls back to leaving the
+// caller's own styling alone when the user has turned it off.
+static void applyEpaperScrim(lv_obj_t* obj) {
+  if (!obj || !touchPrefsGetEpdModalDither()) return;
+  lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_bg_img_src(obj, &kDitherScrim, LV_PART_MAIN);
+  lv_obj_set_style_bg_img_tiled(obj, true, LV_PART_MAIN);
+}
+#endif
+
 static void styleEpaperControlOutline(lv_obj_t* obj, lv_style_selector_t selector) {
   lv_obj_set_style_border_color(obj, lv_color_black(), selector);
   lv_obj_set_style_border_width(obj, 2, selector);
@@ -13105,6 +13140,22 @@ static void epdFullOnScreenToggleCb(lv_event_t* e) {
   touchPrefsSetEpdFullOnScreen(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
+static const uint16_t k_epd_lock_refresh_opts[] = { 0, 30, 60, 300, 900 };
+
+static void epdLockRefreshSelectCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const uint16_t i = lv_dropdown_get_selected(lv_event_get_target(e));
+  if (i >= (sizeof(k_epd_lock_refresh_opts) / sizeof(k_epd_lock_refresh_opts[0]))) return;
+  touchPrefsSetEpdLockRefreshSecs(k_epd_lock_refresh_opts[i]);
+  if (g_lv.task) g_lv.task->showAlert(TR("Lock screen refresh saved"), 900);
+}
+
+static void epdModalDitherToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  touchPrefsSetEpdModalDither(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+  if (g_lv.task) g_lv.task->showAlert(TR("Reopen the dialog to see the change"), 1200);
+}
+
 static void epdFullOnWakeToggleCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   touchPrefsSetEpdFullOnWake(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
@@ -14553,6 +14604,34 @@ static void buildDeviceSettings(int sec) {
       y += LV_MAX(SC(34), h + 12);
     }
 
+    y += settingsRowLabel(body, y, 0, TR("Redraw lock screen every"), COLOR_SUB, &g_font_12, 0) + 2;
+    {
+      lv_obj_t* dd = lv_dropdown_create(body);
+      lv_dropdown_set_options(dd, TR("Never\n30 s\n1 min\n5 min\n15 min"));
+      const uint16_t cur = touchPrefsGetEpdLockRefreshSecs();
+      uint16_t sel = 2;   // 1 min
+      for (uint16_t i = 0; i < (sizeof(k_epd_lock_refresh_opts) / sizeof(k_epd_lock_refresh_opts[0])); ++i)
+        if (k_epd_lock_refresh_opts[i] == cur) { sel = i; break; }
+      lv_dropdown_set_selected(dd, sel);
+      lv_obj_set_width(dd, lv_pct(100));
+      lv_obj_set_pos(dd, 2, y);
+      styleDropdown(dd);
+      lv_obj_add_event_cb(dd, epdLockRefreshSelectCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += SC(34);
+    }
+    y += settingsRowLabel(body, y, 0,
+                          TR("the panel holds its image with the power off, so a locked clock goes stale"),
+                          COLOR_SUB, &g_font_12, 0) + 2;
+
+    {
+      int h = settingsRowLabel(body, y, 6, TR("Dither behind dialogs"), COLOR_SUB, nullptr, 56);
+      lv_obj_t* sw = lv_switch_create(body);
+      lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+      if (touchPrefsGetEpdModalDither()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+      lv_obj_add_event_cb(sw, epdModalDitherToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += LV_MAX(SC(34), h + 12);
+    }
+
     {
       lv_obj_t* b = lv_btn_create(body);
       lv_obj_set_size(b, lv_pct(100), SC(34));
@@ -15708,6 +15787,9 @@ static void showConfirm(const char* msg, const char* ok_label, SimpleCb on_confi
                   lv_disp_get_ver_res(nullptr) - STATUSBAR_H);
   lv_obj_set_pos(s_confirm_modal, 0, STATUSBAR_H);
   lv_obj_set_style_bg_opa(s_confirm_modal, LV_OPA_60, LV_PART_MAIN);
+#if defined(HAS_TDECK_PRO)
+  applyEpaperScrim(s_confirm_modal);
+#endif
   lv_obj_set_style_bg_color(s_confirm_modal, lv_color_black(), LV_PART_MAIN);
   lv_obj_clear_flag(s_confirm_modal, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(s_confirm_modal, LV_OBJ_FLAG_FLOATING);
@@ -28165,6 +28247,9 @@ static void ctDeleteProgressOpen(){
   lv_obj_set_pos(s_ctd_overlay, 0, 0);
   lv_obj_set_style_bg_color(s_ctd_overlay, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_ctd_overlay, LV_OPA_70, LV_PART_MAIN);
+#if defined(HAS_TDECK_PRO)
+  applyEpaperScrim(s_ctd_overlay);
+#endif
   lv_obj_clear_flag(s_ctd_overlay, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(s_ctd_overlay, LV_OBJ_FLAG_CLICKABLE);   // swallow taps during the delete
 
@@ -40373,8 +40458,22 @@ static void lockscreenUpdateUnread() {
   if (n == s_lock_unread_n) return;
   s_lock_unread_n = n;
   if (n <= 0) { lv_obj_add_flag(s_lock_unread, LV_OBJ_FLAG_HIDDEN); return; }
-  char b[24];
+  char b[48];
+#if defined(HAS_TDECK_PRO)
+  // Split by kind. One combined number tells you something arrived but not
+  // whether it is worth unlocking for -- a busy public channel and a direct
+  // message from a person are very different things, and on a device you have
+  // to deliberately unlock that distinction is most of the value.
+  int ch = 0, dm = 0;
+  g_lv.task->getUnreadSplit(&ch, &dm);
+  if (ch > 0 && dm > 0)      snprintf(b, sizeof b, TOUCH_SYM_GROUP " %d   " TOUCH_SYM_PERSON " %d", ch, dm);
+  else if (ch > 0)           snprintf(b, sizeof b, TOUCH_SYM_GROUP " %d", ch);
+  else if (dm > 0)           snprintf(b, sizeof b, TOUCH_SYM_PERSON " %d", dm);
+  else                       snprintf(b, sizeof b, LV_SYMBOL_ENVELOPE "  %d", n);
+  useChainedFont(s_lock_unread);   // the group/person glyphs live in the fallback chain
+#else
   snprintf(b, sizeof b, LV_SYMBOL_ENVELOPE "  %d", n);
+#endif
   lv_label_set_text(s_lock_unread, b);
   lv_obj_clear_flag(s_lock_unread, LV_OBJ_FLAG_HIDDEN);
 }
@@ -40425,10 +40524,16 @@ static void lockscreenUnlockProgress(unsigned long remaining_ms) {
 static void lockscreenShow() {
   // The status bar sits on lv_layer_sys (above this overlay); drop its opaque
   // background + accent border so the wallpaper shows through behind the icons.
+#if !defined(HAS_TDECK_PRO)
   if (g_statusbar.root) {
     lv_obj_set_style_bg_opa(g_statusbar.root, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_opa(g_statusbar.root, LV_OPA_TRANSP, LV_PART_MAIN);
   }
+#endif
+  // On e-paper the bar keeps its normal styling instead: it is the only place
+  // wifi/battery/signal are shown, and a locked device is exactly when you want
+  // to read them without unlocking. Transparency existed to let the wallpaper
+  // through, and there is no wallpaper here.
   if (s_lock_root) { lv_obj_move_foreground(s_lock_root); return; }
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
   const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
@@ -40437,7 +40542,14 @@ static void lockscreenShow() {
   lv_obj_remove_style_all(s_lock_root);
   lv_obj_set_size(s_lock_root, sw, sh);
   lv_obj_set_pos(s_lock_root, 0, 0);
+#if defined(HAS_TDECK_PRO)
+  // Paper, not ink. A black fill is a full screen of ink on this panel: slow to
+  // push, heavy on ghosting, and the exact inverse of every other screen in the
+  // UI now that the board runs a light treatment.
+  lv_obj_set_style_bg_color(s_lock_root, lv_color_white(), LV_PART_MAIN);
+#else
   lv_obj_set_style_bg_color(s_lock_root, lv_color_black(), LV_PART_MAIN);
+#endif
   lv_obj_set_style_bg_opa(s_lock_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_clear_flag(s_lock_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(s_lock_root, LV_OBJ_FLAG_CLICKABLE);   // absorb taps (no UI leak)
@@ -40455,6 +40567,13 @@ static void lockscreenShow() {
   // Wallpaper, scaled to cover the screen (crop overflow, never letterbox).
   int ww = 0, wh = 0;
   const uint8_t* wall_data = nullptr;
+#if defined(HAS_TDECK_PRO)
+  // No wallpaper on e-paper. The art is a photographic RGB565 embed; reduced to
+  // one bit it is a field of dither noise that the clock and counts then have to
+  // compete with, and every pixel of it is ink the panel has to push. A locked
+  // e-paper screen wants to be a clean sheet with a few large figures on it.
+  goto lock_no_wallpaper;
+#endif
   if (s_lock_wall) {
     // Invalidate LVGL's image cache entry for s_lock_wall_dsc BEFORE freeing the
     // buffer it points at. s_lock_wall_dsc is a static var (stable address), and
@@ -40515,6 +40634,10 @@ static void lockscreenShow() {
     lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
   }
 
+#if defined(HAS_TDECK_PRO)
+lock_no_wallpaper:
+#endif
+
 #if defined(TLORA_PAGER) || defined(HAS_TDECK_PRO)
   // Force a guaranteed-visible white here rather than the shared, user-
   // customizable touchPrefsGetLockTextColor() -- on this board that pref was
@@ -40522,7 +40645,11 @@ static void lockscreenShow() {
   // background) even at the shared soft-white default (0xE6F2FF), so this
   // board gets pure white instead of chasing a per-device pref/storage
   // question for a cosmetic lock screen.
+  #if defined(HAS_TDECK_PRO)
+  const lv_color_t col = lv_color_black();     // ink on the paper background above
+  #else
   const lv_color_t col = lv_color_hex(0xFFFFFFu);
+  #endif
 #else
   const lv_color_t col = lv_color_hex(touchPrefsGetLockTextColor());
 #endif
@@ -46814,6 +46941,9 @@ static void buildGlobalStatusBar() {
   lv_obj_set_pos(g_statusbar.dim, 0, 0);
   lv_obj_set_style_bg_color(g_statusbar.dim, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(g_statusbar.dim, LV_OPA_50, LV_PART_MAIN);
+#if defined(HAS_TDECK_PRO)
+  applyEpaperScrim(g_statusbar.dim);
+#endif
   lv_obj_clear_flag(g_statusbar.dim, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(g_statusbar.dim, LV_OBJ_FLAG_CLICKABLE);   // swallow bar taps behind a modal
   lv_obj_add_flag(g_statusbar.dim, LV_OBJ_FLAG_HIDDEN);
@@ -56222,6 +56352,21 @@ int UITask::getUnreadTotal() const {
   return total;
 }
 
+// Same filter as getUnreadTotal (channels always; DMs only with displayable
+// history), just kept apart. Not cached: the only caller is the lock screen,
+// which asks at most once a minute.
+void UITask::getUnreadSplit(int* channels, int* contacts) const {
+  int ch = 0, dm = 0;
+  for (int i = 0; i < MAX_UI_THREADS; ++i) {
+    if (!_ui_threads[i].used) continue;
+    if (!_ui_threads[i].channel && !threadHasMessageHistory(i)) continue;
+    if (_ui_threads[i].channel) ch += _ui_threads[i].unread;
+    else                        dm += _ui_threads[i].unread;
+  }
+  if (channels) *channels = ch;
+  if (contacts) *contacts = dm;
+}
+
 void UITask::markThreadRead(int idx) {
   if (idx < 0 || idx >= MAX_UI_THREADS || !_ui_threads[idx].used) return;
   if (_ui_threads[idx].unread == 0 && !_ui_threads[idx].has_mention) return;
@@ -59690,6 +59835,27 @@ void UITask::loop() {
   uiCp("ui:lvgl");
   lv_timer_handler();
 #if defined(HAS_TDECK_PRO)
+#if defined(HAS_TDECK_PRO)
+  // Locked/idle clock upkeep. serviceLockscreen() already rewrites the labels on
+  // the minute, but with the screen off nothing asks the panel to show it -- the
+  // last frame simply stays on the glass, so a locked device sits there
+  // displaying a time that is quietly hours old. This forces a commit on its own
+  // schedule (default once a minute; 0 disables), bypassing the refresh floor
+  // because the whole point is that nothing else is driving updates right now.
+  {
+    const uint16_t lock_period_s = touchPrefsGetEpdLockRefreshSecs();
+    static uint32_t s_lock_commit_ms = 0;
+    const bool idle = g_lv.task && (g_lv.task->isScreenOff() || g_lv.task->isManualLock());
+    if (lock_period_s && idle) {
+      if ((uint32_t)(millis() - s_lock_commit_ms) >= (uint32_t)lock_period_s * 1000u) {
+        s_lock_commit_ms = millis();
+        display.serviceRefresh(true);
+      }
+    } else {
+      s_lock_commit_ms = millis();   // re-arm so unlocking does not fire one immediately
+    }
+  }
+#endif
   display.serviceRefresh();   // one coalesced e-paper update after all LVGL bands
 #endif
   uiCp("ui:tail");
