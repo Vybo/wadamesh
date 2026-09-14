@@ -40420,13 +40420,27 @@ static void lockscreenUpdateClock() {
     mm = (int)((millis() / 60000u) % 60u);
   }
   lv_label_set_text(s_lock_clock, b);
-#if defined(TLORA_PAGER) || defined(HAS_TDECK_PRO)
+#if defined(HAS_TDECK_PRO)
+  // Ink, to match the paper lock background. This function re-applies the colour
+  // on every minute rollover, so it silently undid the black set at creation and
+  // painted the clock white on white -- invisible, while the unread counters
+  // (which this function never touches) stayed perfectly readable. If the lock
+  // background ever changes again, THIS is the second place that has to follow.
+  //
+  // No warn colour either: at one bit it cannot be distinguished from the normal
+  // one. The two states are already distinguishable by content -- a real clock
+  // reads HH:MM, an unsynced one shows an uptime.
+  const lv_color_t normal_color = lv_color_black();
+  lv_obj_set_style_text_color(s_lock_clock, normal_color, LV_PART_MAIN);
+#else
+#if defined(TLORA_PAGER)
   const lv_color_t normal_color = lv_color_hex(0xFFFFFFu);
 #else
   const lv_color_t normal_color = lv_color_hex(touchPrefsGetLockTextColor());
 #endif
   lv_obj_set_style_text_color(s_lock_clock,
       current ? normal_color : lv_color_hex(COLOR_STATUS_WARN), LV_PART_MAIN);
+#endif
   s_lock_clock_current = current ? 1 : 0;
   // Anti-burn-in drift: nudge the clock a few pixels per minute so its outline never
   // parks on the same LCD cells — wyvern.red reported the lock layout retaining into

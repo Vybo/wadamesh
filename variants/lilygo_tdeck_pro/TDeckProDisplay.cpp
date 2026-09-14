@@ -71,20 +71,6 @@ bool TDeckProDisplay::begin() {
 
   resetTouch();
 
-  // Scan AFTER the reset, not before. A CST328 does not ACK until it has been
-  // reset, so a scan taken first reports no 0x1A on a board that plainly has
-  // one -- which is exactly how this diagnostic first misled us.
-  {
-    size_t n = 0;
-    _i2c_scan[0] = '\0';
-    for (uint8_t addr = 0x08; addr < 0x78 && n + 4 < sizeof _i2c_scan; ++addr) {
-      Wire.beginTransmission(addr);
-      if (Wire.endTransmission() == 0)
-        n += (size_t)snprintf(_i2c_scan + n, sizeof _i2c_scan - n, n ? " %02X" : "%02X", addr);
-    }
-    if (n == 0) snprintf(_i2c_scan, sizeof _i2c_scan, "(bus empty)");
-  }
-
 
   // TDECK_PRO_TOUCH_FORCE overrides the probe: 328 or 3530. Unset = probe.
   //
@@ -141,6 +127,32 @@ bool TDeckProDisplay::begin() {
     }
   }
 #endif
+
+  // I2C scan, deliberately LAST -- after the touch controller is initialised.
+  //
+  // It used to sit between resetTouch() and CSE_CST328::begin(), and that is
+  // very likely what was breaking touch init: 112 zero-length address writes
+  // aimed at a freshly-reset controller, immediately before the chip-ID read
+  // that begin() depends on.
+  //
+  // It is also NOT authoritative for the touch chip. A bare
+  // beginTransmission/endTransmission pair with no payload is a zero-length
+  // write, which the CST328 does not ACK -- so 0x1A is absent from this list
+  // even on a unit whose touch demonstrably works. Read it for what ELSE is on
+  // the bus (keyboard 0x34, IMU 0x28, gauge 0x55, charger 0x6B). The
+  // "touch ... try=N" field is the authoritative answer for the controller
+  // itself; the absence of 0x1A here means nothing.
+  {
+    size_t n = 0;
+    _i2c_scan[0] = '\0';
+    for (uint8_t addr = 0x08; addr < 0x78 && n + 4 < sizeof _i2c_scan; ++addr) {
+      if (addr == (uint8_t)PIN_TOUCH_ADDR) continue;   // never poke the touch chip
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0)
+        n += (size_t)snprintf(_i2c_scan + n, sizeof _i2c_scan - n, n ? " %02X" : "%02X", addr);
+    }
+    if (n == 0) snprintf(_i2c_scan, sizeof _i2c_scan, "(bus empty)");
+  }
 
   _is_on = true;
   Serial.printf("[BOOT] T-Deck Pro e-paper ready touch=%s\n",
