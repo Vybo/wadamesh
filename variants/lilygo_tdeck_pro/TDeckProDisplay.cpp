@@ -6,6 +6,16 @@
 
 TDeckProDisplay::BusyHook TDeckProDisplay::_busy_hook = nullptr;
 
+// HARDWARE v1.0 pin swap. Applied at FILE scope on purpose: the CSE_CST328
+// member below captures the reset pin in the constructor's initialiser list, and
+// that library does its own hardware reset with it -- an override placed inside
+// resetTouch() would fix our reset and leave the library's pointing at the wrong
+// pin, which is worse than not overriding at all because it half-works.
+#if defined(TDECK_PRO_HW_V10)
+  #undef  PIN_TOUCH_RST
+  #define PIN_TOUCH_RST 45
+#endif
+
 TDeckProDisplay::TDeckProDisplay()
     : DisplayDriver(WIDTH, HEIGHT),
       _canvas(nullptr),
@@ -38,11 +48,39 @@ bool TDeckProDisplay::begin() {
   _epd.setRotation(0);
   _epd.epd2.setBusyCallback(&TDeckProDisplay::busyCallback);
 
+#if !defined(TDECK_PRO_HW_V10)
   ledcSetup(TDECK_PRO_FRONTLIGHT_CHANNEL, 12000, 8);
   ledcAttachPin(PIN_TFT_LEDA_CTL, TDECK_PRO_FRONTLIGHT_CHANNEL);
+#else
+  // HARDWARE v1.0: GPIO45 is the TOUCH RESET on this revision, not a frontlight.
+  // Attaching an LEDC channel to it and writing 0 (which is what happens a few
+  // lines below on v1.1) holds the touch controller in reset for the whole
+  // session -- it never ACKs on I2C, so the driver reports no touch at all
+  // while the keyboard, which has no reset line, keeps working normally.
+  //
+  // v1.0 also puts the 1.8 V rail enable on GPIO38, which is where v1.1 puts
+  // the touch reset -- so the two pins are effectively swapped between
+  // revisions, and getting it wrong disables touch in both directions.
+  pinMode(PIN_BOARD_1V8_EN, OUTPUT);
+  digitalWrite(PIN_BOARD_1V8_EN, HIGH);   // rail up before anything is addressed
+  delay(10);
+#endif
   writeBrightness(0);
 
   Wire.begin(PIN_BOARD_SDA, PIN_BOARD_SCL, 400000);
+
+  // Scan before touching anything, so the result describes the bus as found.
+  {
+    size_t n = 0;
+    _i2c_scan[0] = '\0';
+    for (uint8_t addr = 0x08; addr < 0x78 && n + 4 < sizeof _i2c_scan; ++addr) {
+      Wire.beginTransmission(addr);
+      if (Wire.endTransmission() == 0)
+        n += (size_t)snprintf(_i2c_scan + n, sizeof _i2c_scan - n, n ? " %02X" : "%02X", addr);
+    }
+    if (n == 0) snprintf(_i2c_scan, sizeof _i2c_scan, "(bus empty)");
+  }
+
   resetTouch();
   // TDECK_PRO_TOUCH_FORCE overrides the probe: 328 or 3530. Unset = probe.
   //
@@ -200,7 +238,11 @@ void TDeckProDisplay::setBrightness(uint8_t brightness) {
 }
 
 void TDeckProDisplay::writeBrightness(uint8_t brightness) {
+#if !defined(TDECK_PRO_HW_V10)
   ledcWrite(TDECK_PRO_FRONTLIGHT_CHANNEL, brightness);
+#else
+  (void)brightness;   // no frontlight pin on v1.0 -- see the note in begin()
+#endif
 }
 
 void TDeckProDisplay::setRefreshPolicy(uint16_t min_interval_ms, uint8_t full_every_n) {

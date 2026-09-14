@@ -49,6 +49,14 @@ public:
     return _touch_ready ? (_touch_is_cst3530 ? "CST3530" : "CST328") : "none";
   }
   void lastTouchRaw(int16_t& x, int16_t& y) const { x = _dbg_raw_x; y = _dbg_raw_y; }
+
+  // Compact list of every address that ACKed on the shared I2C bus at boot,
+  // e.g. "1A 34 55 6B". The single most useful fact when touch is silent: it
+  // separates "the controller is not on the bus" (held in reset, unpowered, or
+  // wrong pins) from "it is there but the driver is talking to it wrongly".
+  // The keyboard at 0x34 doubles as a control -- if it shows and 0x1A does not,
+  // the bus itself is fine.
+  const char* i2cScan() const { return _i2c_scan; }
   void serviceRefresh(bool force = false);
   void setBusyHook(BusyHook hook) { _busy_hook = hook; }
 
@@ -110,6 +118,7 @@ private:
   bool _touch_is_cst3530 = false;
   int16_t _dbg_raw_x = -1;   // last raw sample, BEFORE the bounds test
   int16_t _dbg_raw_y = -1;
+  char _i2c_scan[40] = "(not run)";
   bool _sent_valid = false;
   bool _is_on = false;
 };

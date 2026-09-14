@@ -93,12 +93,13 @@ void heltecV4CapTouchSetSlowPoll(bool) {}
 // string is the only instrument for which controller a unit actually has, and
 // whether it is producing samples at all.
 const char* heltecV4CapTouchDebug() {
-  static char buf[72];
+  static char buf[128];
   int16_t rx = -1, ry = -1;
   display.lastTouchRaw(rx, ry);
-  snprintf(buf, sizeof buf, "touch %s%s raw=%d,%d",
+  snprintf(buf, sizeof buf, "touch %s%s raw=%d,%d\ni2c: %s",
            display.touchKindName(),
-           display.touchReady() ? "" : " MISSING", (int)rx, (int)ry);
+           display.touchReady() ? "" : " MISSING", (int)rx, (int)ry,
+           display.i2cScan());
   return buf;
 }
 void heltecV4CapTouchGetRaw(uint16_t* out_x, uint16_t* out_y) {
