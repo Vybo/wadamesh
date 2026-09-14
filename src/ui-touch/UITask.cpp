@@ -40704,6 +40704,16 @@ lock_no_wallpaper:
   useChainedFont(hint);
 #if defined(HAS_TANMATSU)
   lv_label_set_text(hint, TR("press Volume Down to unlock"));
+#elif defined(HAS_TDECK_PRO)
+  // MUST precede the HAS_PAGER_KEYBOARD arm. This board defines that macro too,
+  // to reuse the pager's TCA8418 driver -- so it used to match the pager's arm
+  // and tell the user to hold Backspace, while
+  // updatePagerBackspaceUnlockHold() is compiled OUT here
+  // (#if !defined(HAS_TDECK_PRO)). The lock screen was giving an instruction
+  // that could not work, on a board where touch is deliberately inert while
+  // locked: the device reads as broken rather than locked. The side button is
+  // the real unlock (see the user-button block in the loop).
+  lv_label_set_text(hint, TR("press the side button to unlock"));
 #elif defined(HAS_PAGER_KEYBOARD)
   // lockscreenShow() DOES run on this board -- lockscreenReveal() (peek on a
   // Backspace tap, or the new-message notify flash while locked) is gated on
@@ -40712,8 +40722,6 @@ lock_no_wallpaper:
   lv_label_set_text(hint, TR("hold Backspace to unlock"));
 #elif defined(HAS_THINKNODE_M9)
   lv_label_set_text(hint, TR("double-press d-pad center to unlock"));
-#elif defined(HAS_TDECK_PRO)
-  lv_label_set_text(hint, TR("press the button to unlock"));
 #elif defined(HAS_WIO_TRACKER_L2)
   lv_label_set_text(hint, TR("hold the wake button to unlock"));
 #else
