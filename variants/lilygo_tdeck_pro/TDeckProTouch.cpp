@@ -89,7 +89,18 @@ bool heltecV4CapTouchIsSwiping() { return swiping; }
 void heltecV4CapTouchSetRotation(uint8_t) {}
 void heltecV4CapTouchSetPointRotation(uint8_t) {}
 void heltecV4CapTouchSetSlowPoll(bool) {}
-const char* heltecV4CapTouchDebug() { return "T-Deck Pro CST328/CST3530"; }
+// Regenerated per call rather than a constant: with no readable Serial this
+// string is the only instrument for which controller a unit actually has, and
+// whether it is producing samples at all.
+const char* heltecV4CapTouchDebug() {
+  static char buf[72];
+  int16_t rx = -1, ry = -1;
+  display.lastTouchRaw(rx, ry);
+  snprintf(buf, sizeof buf, "touch %s%s raw=%d,%d",
+           display.touchKindName(),
+           display.touchReady() ? "" : " MISSING", (int)rx, (int)ry);
+  return buf;
+}
 void heltecV4CapTouchGetRaw(uint16_t* out_x, uint16_t* out_y) {
   if (out_x) *out_x = x;
   if (out_y) *out_y = y;

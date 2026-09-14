@@ -44,7 +44,21 @@ bool TDeckProDisplay::begin() {
 
   Wire.begin(PIN_BOARD_SDA, PIN_BOARD_SCL, 400000);
   resetTouch();
+  // TDECK_PRO_TOUCH_FORCE overrides the probe: 328 or 3530. Unset = probe.
+  //
+  // The probe tests for a 0xCACA reply, but 0xCACA is ALSO the CST328's own
+  // debug-mode chip ID (CSE_CST328 enters 0xD101, reads the info register and
+  // checks (id >> 16) == 0xCACA), so it is not obviously exclusive. A unit whose
+  // controller is mis-sorted gets driven with entirely the wrong protocol and
+  // touch is simply dead, with nothing to say why. The override exists so that
+  // can be settled on a device in two flashes instead of by argument.
+#if defined(TDECK_PRO_TOUCH_FORCE) && (TDECK_PRO_TOUCH_FORCE == 3530)
+  _touch_is_cst3530 = true;
+#elif defined(TDECK_PRO_TOUCH_FORCE) && (TDECK_PRO_TOUCH_FORCE == 328)
+  _touch_is_cst3530 = false;
+#else
   _touch_is_cst3530 = probeCst3530();
+#endif
   if (_touch_is_cst3530) {
     pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
     _touch_ready = initCst3530();
@@ -339,6 +353,10 @@ bool TDeckProDisplay::getTouchPoint(uint16_t& x, uint16_t& y) {
     raw_x = point.x;
     raw_y = point.y;
   }
+  // Stamped BEFORE the range test on purpose: a swapped or out-of-range axis
+  // has to be visible rather than silently dropped.
+  _dbg_raw_x = raw_x;
+  _dbg_raw_y = raw_y;
   if (raw_x < 0 || raw_y < 0 || raw_x >= WIDTH || raw_y >= HEIGHT) return false;
   x = (uint16_t)raw_x;
   y = (uint16_t)raw_y;

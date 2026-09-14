@@ -38,6 +38,17 @@ public:
   void setDisplayRotation(uint8_t rotation);
   void setBrightness(uint8_t brightness);
   bool getTouchPoint(uint16_t& x, uint16_t& y);
+
+  // What the touch probe actually decided, and the last raw sample it saw.
+  // Serial is unusable on this firmware (the companion protocol owns the UART),
+  // so this is the only way to find out which controller a given unit has --
+  // and the two are driven by completely different protocols, so picking wrong
+  // is silent and total.
+  bool touchReady() const { return _touch_ready; }
+  const char* touchKindName() const {
+    return _touch_ready ? (_touch_is_cst3530 ? "CST3530" : "CST328") : "none";
+  }
+  void lastTouchRaw(int16_t& x, int16_t& y) const { x = _dbg_raw_x; y = _dbg_raw_y; }
   void serviceRefresh(bool force = false);
   void setBusyHook(BusyHook hook) { _busy_hook = hook; }
 
@@ -97,6 +108,8 @@ private:
   bool _sleeping = false;
   bool _touch_ready = false;
   bool _touch_is_cst3530 = false;
+  int16_t _dbg_raw_x = -1;   // last raw sample, BEFORE the bounds test
+  int16_t _dbg_raw_y = -1;
   bool _sent_valid = false;
   bool _is_on = false;
 };

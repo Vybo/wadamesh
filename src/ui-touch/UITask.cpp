@@ -58924,6 +58924,13 @@ void UITask::loop() {
     if (!s_touch_scan_logged) {
       s_touch_scan_logged = true;
       pushDiagLine(heltecV4CapTouchDebug());
+#if defined(HAS_TDECK_PRO)
+      // ...and put it on the glass. The diag ring lives in Settings, which is
+      // exactly where you cannot get to when touch is the thing that is broken,
+      // and this board has no readable Serial. A one-shot toast over the
+      // first-run wizard is the only place it is guaranteed to be seen.
+      if (g_lv.task) g_lv.task->showAlert(heltecV4CapTouchDebug(), 4000);
+#endif
     }
     if (g_lv.touch_inited) {
       pushDiagLine("touch init ok");
