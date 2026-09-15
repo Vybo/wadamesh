@@ -304,7 +304,17 @@ void TDeckProDisplay::requestRefresh(bool full) {
 }
 
 void TDeckProDisplay::serviceRefresh(bool force) {
-  if (!_refresh_pending || _sleeping || !_mono) return;
+  if (!_refresh_pending || !_mono) return;
+  // _sleeping must not veto an EXPLICITLY forced commit. This check used to sit
+  // ahead of `force` and swallowed it, which is why the once-a-minute lock-screen
+  // redraw never appeared: every idle path on this board routes through
+  // touchScreenBacklight(false) -> display.turnOff() -> _sleeping = true, so the
+  // periodic block was firing on schedule into a function that could not commit.
+  //
+  // Committing while "asleep" is well-defined on e-paper: the panel holds its
+  // image with the controller unpowered, and serviceRefresh brackets its own
+  // transfer with powerOff() below.
+  if (_sleeping && !force) return;
   const uint32_t now = millis();
   if (!force && _last_refresh_ms && now - _last_refresh_ms < _min_interval_ms) return;
 
@@ -328,7 +338,9 @@ void TDeckProDisplay::serviceRefresh(bool force) {
 
   memcpy(_sent, _mono, MONO_BYTES);
   _sent_valid = true;
-  writeBrightness(_brightness);
+  // Not from a commit taken while asleep -- an idle redraw must not relight the
+  // frontlight. Mirrors the existing guard in setBrightness().
+  if (!_sleeping) writeBrightness(_brightness);
   _last_refresh_ms = millis();
   _refresh_pending = false;
   _full_refresh_pending = false;

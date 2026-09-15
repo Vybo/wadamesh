@@ -150,7 +150,7 @@ static void cfgSetDefaults(TouchCfg& c) {
   // v59 e-paper refresh policy. These reproduce the constants they replaced
   // in TDeckProDisplay, so an existing Pro behaves identically until the
   // user changes something. Inert on every other board.
-  c.epd_min_refresh_ms = 250;
+  c.epd_min_refresh_ms = 100;   // the panel's own commit time is the real floor
   c.epd_full_every_n   = 9;
   c.epd_full_on_screen = 1;   // a page switch changes everything; partial-updating it smears
   c.epd_full_on_wake   = 1;   // clear whatever ghosting accrued while the panel sat idle
@@ -281,7 +281,7 @@ static void cfgLoadOrMigrate() {
         // nonsense policy (a 0 ms interval asks for a refresh every frame) on a
         // panel that physically cannot sustain it.
         if (stored_version < 59) {
-          s_cfg.epd_min_refresh_ms = 250;
+          s_cfg.epd_min_refresh_ms = 100;
           s_cfg.epd_full_every_n   = 9;
           s_cfg.epd_full_on_screen = 1;
           s_cfg.epd_full_on_wake   = 1;

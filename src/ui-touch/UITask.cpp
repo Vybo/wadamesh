@@ -253,14 +253,21 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
 #endif
 
 #if CAP_SLOW_DISPLAY
-// A bistable panel cannot show four updates a second, so producing them only
-// burns CPU on a loop task that also runs the mesh. 2 s stays well inside the
-// refresh policy's own floor, so the panel cadence is still set by the policy.
+// Status-chrome cadence. This gates ONLY refreshStatusLabels() and the unread /
+// discovered badges -- not message repaints, not touch, not toasts.
 //
-// This is NOT what stops the screen changing when nothing happened -- that is
-// the byte-diff against the last-sent frame in TDeckProDisplay::serviceRefresh.
-// This just stops the firmware doing the render in the first place.
-constexpr unsigned long UI_REFRESH_MS = 2000;
+// At 2000 it was the direct cause of a reported oddity: a toast schedules its
+// own hide on an lv_timer (~900 ms) and is not on this clock, so the banner
+// appeared and vanished visibly faster than the clock beside it could change.
+// Same panel, same commit floor -- a 4x cadence difference produced purely
+// here. That asymmetry is the proof the panel was never the constraint.
+//
+// The safety net is already in place: serviceRefresh byte-diffs the whole
+// 9600-byte frame against the last one sent and clears _refresh_pending without
+// touching the panel when nothing changed, so a tick where no status text
+// actually moved costs zero panel updates. The cost of lowering this is CPU,
+// not refreshes.
+constexpr unsigned long UI_REFRESH_MS = 500;
 #else
 constexpr unsigned long UI_REFRESH_MS = 250;
 #endif
@@ -3236,6 +3243,24 @@ static const lv_img_dsc_t kDitherScrim = {
 // caller's own styling alone when the user has turned it off.
 static void applyEpaperScrim(lv_obj_t* obj) {
   if (!obj || !touchPrefsGetEpdModalDither()) return;
+
+  // Only page-covering backdrops. This is called from ~40 sites, found by
+  // pattern (black fill + partial opacity), and not all of them are full-screen
+  // scrims -- a few are small translucent pills such as a hint tooltip or the
+  // map's zoom readout. Those WANT to be a solid plate with text on them; a
+  // checkerboard there would put texture behind the text instead of dimming a
+  // page behind a dialog, which is the opposite of the point.
+  //
+  // Sizing is settled here rather than trusted: every real backdrop in this file
+  // is lv_obj_set_size()'d to the screen before its background is styled, so the
+  // dimensions are already known by the time we are called; update_layout makes
+  // that true for the content-sized ones too.
+  lv_obj_update_layout(obj);
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  if (lv_obj_get_width(obj) < (sw * 3) / 4) return;
+  if (lv_obj_get_height(obj) < sh / 2)      return;
+
   lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
   lv_obj_set_style_bg_img_src(obj, &kDitherScrim, LV_PART_MAIN);
   lv_obj_set_style_bg_img_tiled(obj, true, LV_PART_MAIN);
@@ -6482,6 +6507,9 @@ static void otaPrevVersionsCb(lv_event_t* e) {
   lv_obj_set_pos(bg, 0, 0);
   lv_obj_set_style_bg_color(bg, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(bg, LV_OPA_50, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(bg);
+  #endif
   lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(bg, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(bg, otaPrevModalCloseCb, LV_EVENT_CLICKED, nullptr);
@@ -8328,6 +8356,9 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
   lv_obj_set_pos(s_channel_long_sheet, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_channel_long_sheet, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_channel_long_sheet, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_channel_long_sheet);
+  #endif
   lv_obj_clear_flag(s_channel_long_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(s_channel_long_sheet);
   lv_obj_add_event_cb(s_channel_long_sheet, channelLongSheetDismissCb, LV_EVENT_CLICKED, nullptr);
@@ -8888,6 +8919,9 @@ static void openEmojiPicker(lv_obj_t* ta, const char* const* items = k_emoji_ite
   lv_obj_set_pos(s_emoji_sheet, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_emoji_sheet, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_emoji_sheet, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_emoji_sheet);
+  #endif
   lv_obj_clear_flag(s_emoji_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_emoji_sheet, emojiSheetCloseCb, LV_EVENT_CLICKED, nullptr);
 
@@ -9168,6 +9202,9 @@ static void openQuickReplyPicker(LvChatPanel* p) {
   lv_obj_set_pos(s_qr_sheet, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_qr_sheet, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_qr_sheet, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_qr_sheet);
+  #endif
   lv_obj_clear_flag(s_qr_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_qr_sheet, qrSheetCloseCb, LV_EVENT_CLICKED, nullptr);
 
@@ -11042,6 +11079,9 @@ static void openDiscoveredSettingsSheetCb(lv_event_t* e) {
   lv_obj_set_pos(s_disc_settings_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_disc_settings_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_disc_settings_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_disc_settings_root);
+  #endif
   lv_obj_clear_flag(s_disc_settings_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(s_disc_settings_root);
   lv_obj_add_event_cb(s_disc_settings_root, discSettingsDismissCb, LV_EVENT_CLICKED, nullptr);
@@ -13766,6 +13806,9 @@ static void openExpansionCard() {
   lv_obj_set_pos(s_expansion_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_expansion_root, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_expansion_root, LV_OPA_50, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_expansion_root);
+  #endif
   lv_obj_clear_flag(s_expansion_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_expansion_root, expansionBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -14557,7 +14600,7 @@ static void buildDeviceSettings(int sec) {
       lv_obj_t* dd = lv_dropdown_create(body);
       lv_dropdown_set_options(dd, TR("As fast as possible\n0.1 s\n0.2 s\n0.25 s\n0.5 s\n1 s\n2 s\n5 s"));
       const uint16_t cur = touchPrefsGetEpdMinRefreshMs();
-      uint16_t sel = 3;   // 0.25 s -- the shipped default
+      uint16_t sel = 1;   // 0.1 s -- the shipped default
       for (uint16_t i = 0; i < (sizeof(k_epd_interval_opts) / sizeof(k_epd_interval_opts[0])); ++i)
         if (k_epd_interval_opts[i] == cur) { sel = i; break; }
       lv_dropdown_set_selected(dd, sel);
@@ -17425,6 +17468,9 @@ static void openContactsSearchSheetCb(lv_event_t* e) {
   lv_obj_set_pos(s_contacts_search_sheet, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_contacts_search_sheet, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_contacts_search_sheet, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_contacts_search_sheet);
+  #endif
   lv_obj_clear_flag(s_contacts_search_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_contacts_search_sheet, contactsSearchSheetCloseCb, LV_EVENT_CLICKED, nullptr);
 
@@ -17917,6 +17963,9 @@ static void openAdminCmdPicker() {
   lv_obj_set_pos(s_admin_picker_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_admin_picker_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_admin_picker_root, LV_OPA_70, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_admin_picker_root);
+  #endif
   lv_obj_clear_flag(s_admin_picker_root, LV_OBJ_FLAG_SCROLLABLE);
   // Tap on the dim backdrop dismisses the picker (matches the action
   // sheet / search overlay convention).
@@ -18240,6 +18289,9 @@ static void openAdminLoginPrompt(const ContactInfo& c) {
   lv_obj_set_pos(s_admin_pw_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_admin_pw_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_admin_pw_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_admin_pw_root);
+  #endif
   lv_obj_clear_flag(s_admin_pw_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_admin_pw_root, [](lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -19061,6 +19113,9 @@ static void openLosModal(uint32_t mesh_idx) {
   lv_obj_set_pos(s_los_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_los_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_los_root, LV_OPA_70, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_los_root);
+  #endif
   lv_obj_clear_flag(s_los_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(s_los_root);
   lv_obj_add_event_cb(s_los_root, losModalCloseCb, LV_EVENT_CLICKED, nullptr);
@@ -19174,6 +19229,9 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   lv_obj_set_pos(s_action_sheet_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_action_sheet_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_action_sheet_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_action_sheet_root);
+  #endif
   lv_obj_set_style_pad_all(s_action_sheet_root, 0, LV_PART_MAIN);
   lv_obj_clear_flag(s_action_sheet_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(s_action_sheet_root);
@@ -20009,6 +20067,9 @@ static void openAddChannelSheet() {
   lv_obj_set_pos(s_addch_sheet, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_addch_sheet, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_addch_sheet, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_addch_sheet);
+  #endif
   lv_obj_clear_flag(s_addch_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(s_addch_sheet);
   lv_obj_add_event_cb(s_addch_sheet, addChannelSheetDismissCb, LV_EVENT_CLICKED, nullptr);
@@ -20159,6 +20220,9 @@ static void openShareMyContactPopup() {
   lv_obj_set_pos(s_share_my_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_share_my_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_share_my_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_share_my_root);
+  #endif
   lv_obj_clear_flag(s_share_my_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_share_my_root, shareMyContactBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -20606,6 +20670,9 @@ static void openBatteryChartWindow() {
   lv_obj_set_pos(s_batt_chart_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_batt_chart_root, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_batt_chart_root, LV_OPA_50, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_batt_chart_root);
+  #endif
   lv_obj_clear_flag(s_batt_chart_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_batt_chart_root, batteryChartDismissCb, LV_EVENT_CLICKED, nullptr);
 
@@ -21962,6 +22029,9 @@ static void openTermCmdPicker() {
 #else
   lv_obj_set_style_bg_color(s_term_picker_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_term_picker_root, LV_OPA_70, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_term_picker_root);
+  #endif
 #endif
   lv_obj_clear_flag(s_term_picker_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_term_picker_root, [](lv_event_t* e) {
@@ -22775,6 +22845,9 @@ static void fmTextPrompt(const char* title, const char* initial, void (*cb)(cons
   lv_obj_set_pos(s_fm_prompt, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_fm_prompt, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_fm_prompt, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_fm_prompt);
+  #endif
   lv_obj_clear_flag(s_fm_prompt, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t* card = lv_obj_create(s_fm_prompt);
@@ -23047,6 +23120,9 @@ static void fmOpenActions(const char* name, bool isdir) {
   lv_obj_set_pos(s_fm_actions, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_fm_actions, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_fm_actions, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_fm_actions);
+  #endif
   lv_obj_clear_flag(s_fm_actions, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_fm_actions, [](lv_event_t* ev) {
     if (lv_event_get_code(ev) != LV_EVENT_CLICKED) return;
@@ -23597,6 +23673,9 @@ static void fmOpenImage(const char* name) {
   lv_obj_set_style_text_color(hint, lv_color_white(), LV_PART_MAIN);
   lv_obj_set_style_bg_color(hint, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(hint, LV_OPA_50, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(hint);
+  #endif
   lv_obj_set_style_pad_hor(hint, 6, LV_PART_MAIN);
   lv_obj_set_style_pad_ver(hint, 3, LV_PART_MAIN);
   lv_obj_set_style_radius(hint, 4, LV_PART_MAIN);
@@ -24205,6 +24284,9 @@ static void openSignalInfoPopup() {
   lv_obj_set_pos(s_siginfo_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_siginfo_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_siginfo_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_siginfo_root);
+  #endif
   lv_obj_clear_flag(s_siginfo_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_siginfo_root, sigInfoDismissCb, LV_EVENT_CLICKED, nullptr);
 
@@ -27601,6 +27683,9 @@ static void makeHome(lv_obj_t* tab) {
     lv_obj_set_style_text_color(hint, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
     lv_obj_set_style_bg_color(hint, lv_color_hex(COLOR_BG), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(hint, LV_OPA_70, LV_PART_MAIN);
+    #if defined(HAS_TDECK_PRO)
+      applyEpaperScrim(hint);
+    #endif
     lv_obj_set_style_pad_hor(hint, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(hint, 3, LV_PART_MAIN);
     // Top-right (by request), opposite the top-left "Sig --" chip. On a longer
@@ -27992,6 +28077,9 @@ static void openContactsOverflowSheetCb(lv_event_t* e) {
   lv_obj_set_pos(s_contacts_overflow_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_contacts_overflow_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_contacts_overflow_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_contacts_overflow_root);
+  #endif
   lv_obj_clear_flag(s_contacts_overflow_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(s_contacts_overflow_root);
   lv_obj_add_event_cb(s_contacts_overflow_root, contactsOverflowDismissCb, LV_EVENT_CLICKED, nullptr);
@@ -28423,6 +28511,9 @@ static lv_obj_t* ctOpenOptionSheet(const char* title){
   lv_obj_set_pos(s_ct_sort_sheet, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_ct_sort_sheet, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_ct_sort_sheet, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_ct_sort_sheet);
+  #endif
   lv_obj_clear_flag(s_ct_sort_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_ct_sort_sheet, ctSortSheetBackdropCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_add_event_cb(s_ct_sort_sheet, ctSortSheetGestureCb, LV_EVENT_GESTURE, nullptr);   // swipe-to-close
@@ -32743,6 +32834,9 @@ static void mapOptInfoCb(lv_event_t* e) {
   lv_obj_set_pos(s_map_opts_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_map_opts_root, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_map_opts_root, LV_OPA_70, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_map_opts_root);
+  #endif
   lv_obj_clear_flag(s_map_opts_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_map_opts_root, mapOptionsDismissCb, LV_EVENT_CLICKED, nullptr);
 
@@ -32814,6 +32908,9 @@ static void openMapOptions() {
   lv_obj_set_pos(s_map_opts_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_map_opts_root, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_map_opts_root, LV_OPA_50, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_map_opts_root);
+  #endif
   lv_obj_clear_flag(s_map_opts_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_map_opts_root, mapOptionsDismissCb, LV_EVENT_CLICKED, nullptr);
 
@@ -33059,6 +33156,9 @@ static void openMapPicker(const int* idxs, int n) {
   lv_obj_set_pos(s_map_picker_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_map_picker_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_map_picker_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_map_picker_root);
+  #endif
   lv_obj_clear_flag(s_map_picker_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_map_picker_root, mapPickerBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -33337,6 +33437,9 @@ static void openMapContactsList() {
   lv_obj_set_pos(s_map_contacts_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_map_contacts_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_map_contacts_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_map_contacts_root);
+  #endif
   lv_obj_clear_flag(s_map_contacts_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_map_contacts_root, mapContactsBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -34087,6 +34190,9 @@ static void makeMapTab(lv_obj_t* tab) {
   lv_obj_set_style_text_color(s_map_zoom_val, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   lv_obj_set_style_bg_color(s_map_zoom_val, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_map_zoom_val, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_map_zoom_val);
+  #endif
   lv_obj_set_style_pad_hor(s_map_zoom_val, 6, LV_PART_MAIN);
   lv_obj_set_style_pad_ver(s_map_zoom_val, 2, LV_PART_MAIN);
   lv_obj_set_style_radius(s_map_zoom_val, 4, LV_PART_MAIN);
@@ -35573,6 +35679,9 @@ static void openTraceResultPopup(const char* title, const char* body) {
   lv_obj_set_pos(s_trace_result_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_trace_result_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_trace_result_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_trace_result_root);
+  #endif
   lv_obj_clear_flag(s_trace_result_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_trace_result_root, traceResultBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -35823,6 +35932,9 @@ static void openMessageActionMenu(int msg_idx) {
   lv_obj_set_pos(s_msg_menu_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_msg_menu_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_msg_menu_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_msg_menu_root);
+  #endif
   lv_obj_clear_flag(s_msg_menu_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_msg_menu_root, msgMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -35972,6 +36084,9 @@ static void openMessageInfoPopup(int msg_idx) {
   lv_obj_set_pos(s_msg_info_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_msg_info_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_msg_info_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_msg_info_root);
+  #endif
   lv_obj_clear_flag(s_msg_info_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_msg_info_root, msgInfoBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -37454,6 +37569,9 @@ static void openUrlQrPopup(const char* url) {
   lv_obj_set_pos(s_urlqr_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_urlqr_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_urlqr_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_urlqr_root);
+  #endif
   lv_obj_clear_flag(s_urlqr_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_urlqr_root, urlQrBackdropCb, LV_EVENT_CLICKED, nullptr);
   int card_w = PCW(230); if (card_w > modalAvailW()) card_w = modalAvailW();
@@ -37541,6 +37659,9 @@ static void openUrlMenu(const char* url) {
   lv_obj_set_pos(s_urlmenu_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_urlmenu_root, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_urlmenu_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_urlmenu_root);
+  #endif
   lv_obj_clear_flag(s_urlmenu_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_urlmenu_root, urlMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
   const int card_w = PCW(230), btn_h = PSC(34), pad = PSC(12), gap = PSC(8), url_h = PSC(18);
@@ -39759,6 +39880,9 @@ static void pagerLockingPopupShow() {
   lv_obj_set_pos(s_pager_locking_popup, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_pager_locking_popup, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_pager_locking_popup, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_pager_locking_popup);
+  #endif
   lv_obj_clear_flag(s_pager_locking_popup, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t* card = lv_obj_create(s_pager_locking_popup);
@@ -41180,6 +41304,9 @@ static void doBackupImportChosen() {
   lv_obj_set_size(ov, lv_disp_get_hor_res(nullptr), lv_disp_get_ver_res(nullptr));
   lv_obj_set_style_bg_color(ov, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(ov, LV_OPA_70, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(ov);
+  #endif
   lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
   { lv_obj_t* ol = lv_label_create(ov); lv_label_set_text(ol, TR("Importing settings\xe2\x80\xa6"));
     lv_obj_set_style_text_color(ol, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
@@ -41320,6 +41447,9 @@ static void doExportBackupFile(const char* fname) {
   lv_obj_set_size(ov, lv_disp_get_hor_res(nullptr), lv_disp_get_ver_res(nullptr));
   lv_obj_set_style_bg_color(ov, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(ov, LV_OPA_70, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(ov);
+  #endif
   lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
   { lv_obj_t* ol = lv_label_create(ov);
     lv_label_set_text(ol, TR("Exporting settings\xe2\x80\xa6"));
@@ -41608,6 +41738,9 @@ static void startLockingCountdown() {
   lv_obj_set_pos(s_locking_popup, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_locking_popup, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_locking_popup, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_locking_popup);
+  #endif
   lv_obj_clear_flag(s_locking_popup, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_locking_popup, lockingCountdownTapCb, LV_EVENT_CLICKED, nullptr);
 
@@ -43377,6 +43510,9 @@ static void openPowerMenu() {
   lv_obj_set_pos(s_power_menu, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_power_menu, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_power_menu, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_power_menu);
+  #endif
   lv_obj_clear_flag(s_power_menu, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_power_menu, powerMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -43763,6 +43899,9 @@ static void openControlCenter() {
   // the screen behind the translucent card — that keeps the panel's own content crisp/readable
   // while the card fill stays see-through enough to still read as glass.
   lv_obj_set_style_bg_opa(s_cc_root, LV_OPA_70, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_cc_root);
+  #endif
   lv_obj_clear_flag(s_cc_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_move_foreground(s_cc_root);
   lv_obj_add_event_cb(s_cc_root, ccBackdropCb, LV_EVENT_CLICKED, nullptr);
@@ -45944,6 +46083,9 @@ static void openAppGridSheet() {
   lv_obj_set_pos(s_appgrid_sheet, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_appgrid_sheet, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_appgrid_sheet, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_appgrid_sheet);
+  #endif
   lv_obj_clear_flag(s_appgrid_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_appgrid_sheet, appGridBackdropCb, LV_EVENT_CLICKED, nullptr);
 
@@ -50669,6 +50811,9 @@ static void openTelemetryWindow(const uint8_t* key6, const char* name, int state
   lv_obj_set_pos(s_telemetry_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_telemetry_root, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_telemetry_root, LV_OPA_50, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_telemetry_root);
+  #endif
   lv_obj_clear_flag(s_telemetry_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_telemetry_root, telemetryWindowDismissCb, LV_EVENT_CLICKED, nullptr);
 
@@ -50914,6 +51059,9 @@ static void openTelemetryConfigWindow() {
   lv_obj_set_pos(s_telem_config_root, 0, STATUSBAR_H);
   lv_obj_set_style_bg_color(s_telem_config_root, lv_color_black(), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_telem_config_root, LV_OPA_60, LV_PART_MAIN);
+  #if defined(HAS_TDECK_PRO)
+    applyEpaperScrim(s_telem_config_root);
+  #endif
   lv_obj_clear_flag(s_telem_config_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_telem_config_root, telemCfgDismissCb, LV_EVENT_CLICKED, nullptr);
 
@@ -59461,12 +59609,14 @@ void UITask::loop() {
     updatePagerAltBackspaceChord();
     updatePagerBackspaceHold(now);
     updatePagerSpaceHold(now);
-    // Missing on this board until now (T-Deck/M9 both already call it in their
-    // own equivalent branch): without this the lock-screen clock/unread badge
-    // never refreshed again after the first reveal -- correct at the moment
-    // you peek, then frozen there for as long as the screen stays lit.
-    serviceLockscreen();
   }
+  // OUTSIDE the if/else above, so it runs while the screen is OFF too. It sat in
+  // the not-screen-off arm, and UITask::lockScreen() on the Pro ends with
+  // _screen_off = true -- so a locked device took a different arm and the clock
+  // was never rewritten again. The T-Deck and M9 arms already call this
+  // unconditionally. Self-guarding: early-returns on !s_lock_root and only
+  // touches labels on an actual minute rollover.
+  serviceLockscreen();
 #elif defined(HAS_M9_KEYBOARD)
   // Own the stall buckets for everything a keypress triggers. The "ui:input"
   // checkpoint further up is inside #if CAP_TRACKBALL, which is 0 on this board

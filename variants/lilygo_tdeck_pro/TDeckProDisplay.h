@@ -82,7 +82,12 @@ public:
 
 private:
   using Panel = GxEPD2_310_GDEQ031T10;
-  using Eink = GxEPD2_BW<Panel, 40>;
+  // Full-height page buffer: with _pages == 1 the do/while in serviceRefresh
+  // walks the 240x320 source bitmap ONCE per commit instead of 8 pages x 2
+  // fast-partial phases (~1.23M inner iterations). Costs 9600 bytes of internal
+  // DRAM instead of 1200, and matters most while locked, where the CPU has been
+  // dropped to 80 MHz for the idle redraw.
+  using Eink = GxEPD2_BW<Panel, 320>;
 
   static void busyCallback(const void*);
   static bool isDark(uint16_t color);
